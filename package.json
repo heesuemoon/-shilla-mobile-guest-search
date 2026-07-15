@@ -1,0 +1,17 @@
+{
+  "name": "shilla-mobile-guest-search",
+  "version": "1.0.0",
+  "description": "Shilla Duty Free mobile guest search scraper web app using Playwright.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "install:browsers": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.54.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
