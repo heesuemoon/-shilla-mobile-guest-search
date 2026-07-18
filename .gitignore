@@ -5,3 +5,4 @@ test-results/
 *.log
 .shilla-storage-state.json
 .shilla-storage-state.base64.txt
+.shilla-chrome-profile/

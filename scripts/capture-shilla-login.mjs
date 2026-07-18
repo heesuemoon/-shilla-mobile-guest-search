@@ -6,25 +6,38 @@ import { chromium, devices } from 'playwright';
 
 const statePath = path.resolve(process.env.SHILLA_STORAGE_STATE_PATH || '.shilla-storage-state.json');
 const base64Path = path.resolve('.shilla-storage-state.base64.txt');
+const profileDir = path.resolve(process.env.SHILLA_PROFILE_DIR || '.shilla-chrome-profile');
 const verifyUrl = process.env.SHILLA_LOGIN_VERIFY_URL || 'https://m.shilladfs.com/estore/kr/ko/p/5621582';
 
-async function launchBrowser() {
+async function launchLoginContext() {
+  const options = {
+    ...(devices['iPhone 13'] || {}),
+    headless: false,
+    locale: 'ko-KR',
+    timezoneId: 'Asia/Seoul',
+    ignoreHTTPSErrors: true,
+    extraHTTPHeaders: {
+      'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    },
+  };
+
   try {
-    return await chromium.launch({ channel: 'chrome', headless: false });
-  } catch {
-    return chromium.launch({ headless: false });
+    return await chromium.launchPersistentContext(profileDir, { ...options, channel: 'chrome' });
+  } catch (chromeError) {
+    try {
+      return await chromium.launchPersistentContext(profileDir, options);
+    } catch {
+      throw chromeError;
+    }
   }
 }
 
-const browser = await launchBrowser();
-const context = await browser.newContext({
-  ...(devices['iPhone 13'] || {}),
-  locale: 'ko-KR',
-  timezoneId: 'Asia/Seoul',
-  ignoreHTTPSErrors: true,
-  extraHTTPHeaders: {
-    'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-  },
+const context = await launchLoginContext().catch((error) => {
+  console.error('');
+  console.error('Chrome 로그인 프로필을 열 수 없습니다.');
+  console.error('앱을 켜둔 상태라면 npm start가 실행 중인 터미널에서 control + C를 누른 뒤 다시 실행하세요.');
+  console.error(error.message || error);
+  process.exit(1);
 });
 
 const page = await context.newPage();
@@ -60,9 +73,10 @@ await context.storageState({ path: statePath });
 const stateJson = await readFile(statePath, 'utf8');
 await writeFile(base64Path, Buffer.from(stateJson, 'utf8').toString('base64'));
 
-await browser.close();
+await context.close();
 
 console.log('');
 console.log(`로그인 세션 파일: ${statePath}`);
+console.log(`로그인 Chrome 프로필: ${profileDir}`);
 console.log(`Render 환경변수 SHILLA_STORAGE_STATE_BASE64 값: ${base64Path}`);
-console.log('이 파일 내용 전체를 Render Environment에 붙여넣으면 로그인 기준 혜택 조회가 됩니다.');
+console.log('로컬 앱은 이 Chrome 프로필을 사용해 로그인 기준 혜택 조회를 실행합니다.');

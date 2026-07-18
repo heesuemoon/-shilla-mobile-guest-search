@@ -19,6 +19,8 @@ const SEARCH_PATH = '/estore/kr/ko/search';
 const DEFAULT_MAX_RESULTS = 50;
 const DEFAULT_BENEFIT_MAX_RESULTS = 60;
 const LOGIN_STORAGE_STATE_PATH = process.env.SHILLA_STORAGE_STATE_PATH || path.join(appRootDir, '.shilla-storage-state.json');
+const LOGIN_PROFILE_DIR = process.env.SHILLA_PROFILE_DIR || path.join(appRootDir, '.shilla-chrome-profile');
+const USE_LOGIN_PROFILE = !IS_HOSTED_RUNTIME && process.env.SHILLA_DISABLE_PROFILE !== 'true';
 const LOGIN_LABEL = process.env.SHILLA_LOGIN_LABEL || '';
 const LOGIN_COOKIE_NAMES = new Set(['sda_tokenKR', 'shilladfsKRRM']);
 const DETAIL_SECURITY_COOKIE_NAMES = new Set(['cf_clearance', '__cf_bm']);
@@ -46,6 +48,8 @@ const BRAND_QUERY_VARIANTS = new Map([
 ]);
 
 let browserPromise;
+let loginContextPromise;
+let loginPersistentContext;
 let loginStorageStateCache;
 let loginSessionProbeCache;
 
@@ -162,6 +166,69 @@ async function launchBrowser() {
   }
 }
 
+async function launchPersistentLoginContext() {
+  const device = devices['iPhone 13'] || {};
+  const baseOptions = {
+    ...device,
+    headless: false,
+    locale: 'ko-KR',
+    timezoneId: 'Asia/Seoul',
+    ignoreHTTPSErrors: true,
+    args: ['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--no-sandbox'],
+    extraHTTPHeaders: {
+      'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    },
+  };
+
+  const fallbackOptions = [{ channel: 'chrome' }];
+  const macChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+  if (process.env.CHROME_PATH) {
+    fallbackOptions.unshift({ executablePath: process.env.CHROME_PATH });
+  }
+
+  if (existsSync(macChromePath)) {
+    fallbackOptions.push({ executablePath: macChromePath });
+  }
+
+  let firstError;
+  for (const fallback of [{}, ...fallbackOptions]) {
+    try {
+      return await chromium.launchPersistentContext(LOGIN_PROFILE_DIR, { ...baseOptions, ...fallback });
+    } catch (error) {
+      firstError ||= error;
+    }
+  }
+
+  throw firstError;
+}
+
+async function getLoginPersistentContext() {
+  if (!loginContextPromise) {
+    loginContextPromise = launchPersistentLoginContext()
+      .then(async (context) => {
+        loginPersistentContext = context;
+        await context.addInitScript(() => {
+          Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        });
+
+        const storageState = await getLoginStorageStateObject().catch(() => null);
+        if (storageState?.cookies?.length) {
+          await context.addCookies(storageState.cookies).catch(() => {});
+        }
+
+        return context;
+      })
+      .catch((error) => {
+        loginContextPromise = undefined;
+        loginPersistentContext = undefined;
+        throw error;
+      });
+  }
+
+  return loginContextPromise;
+}
+
 function getLoginStorageState() {
   if (loginStorageStateCache !== undefined) return loginStorageStateCache;
 
@@ -201,7 +268,8 @@ async function getLoginStorageStateObject() {
 }
 
 async function probeLoginSessionAccess(sessionInfo) {
-  if (!sessionInfo.loginTokenValid || !sessionInfo.detailAccessValid) return sessionInfo;
+  if (!sessionInfo.loginTokenValid) return sessionInfo;
+  if (!sessionInfo.detailAccessValid && !USE_LOGIN_PROFILE) return sessionInfo;
 
   const now = Date.now();
   if (loginSessionProbeCache && now - loginSessionProbeCache.checkedAt < SESSION_PROBE_TTL_MS) {
@@ -212,7 +280,7 @@ async function probeLoginSessionAccess(sessionInfo) {
     };
   }
 
-  const browser = await getBrowser();
+  const browser = USE_LOGIN_PROFILE ? null : await getBrowser();
   const context = await createMobileContext(browser, { useLogin: true });
   const page = await context.newPage();
 
@@ -221,7 +289,9 @@ async function probeLoginSessionAccess(sessionInfo) {
     await gotoAndContinue(page, SESSION_PROBE_URL, { timeout: 20000 });
     await page.waitForSelector('body', { timeout: 8000 }).catch(() => {});
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const securityCheckAttempts = IS_HOSTED_RUNTIME ? 3 : 20;
+    const securityCheckDelayMs = IS_HOSTED_RUNTIME ? 1500 : 3000;
+    for (let attempt = 0; attempt < securityCheckAttempts; attempt += 1) {
       const isSecurityCheck = await page
         .evaluate(() =>
           /보안 확인|잠시만 기다리십시오|cloudflare|verify you are human|just a moment|enable javascript and cookies|challenge-platform|cf_chl/i.test(
@@ -230,7 +300,7 @@ async function probeLoginSessionAccess(sessionInfo) {
         )
         .catch(() => false);
       if (!isSecurityCheck) break;
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(securityCheckDelayMs);
     }
 
     const probe = await page
@@ -300,7 +370,7 @@ async function probeLoginSessionAccess(sessionInfo) {
     return { ...sessionInfo, ...result, probedAt: new Date(now).toISOString() };
   } finally {
     await page.close().catch(() => {});
-    await context.close().catch(() => {});
+    await closeMobileContext(context);
   }
 }
 
@@ -327,6 +397,7 @@ async function getLoginSessionInfo({ probe = false } = {}) {
   const hasCfBm = activeDetailSecurityCookies.some((cookie) => cookie.name === '__cf_bm');
   const loginTokenValid = activeCookies.length > 0;
   const detailAccessValid = loginTokenValid && hasCfClearance && hasCfBm;
+  const loginValid = USE_LOGIN_PROFILE ? loginTokenValid : detailAccessValid;
   const expiresAt = activeCookies
     .map((cookie) => Number(cookie.expires || 0))
     .filter((expires) => expires > 0)
@@ -340,13 +411,15 @@ async function getLoginSessionInfo({ probe = false } = {}) {
   if (!loginTokenValid) {
     reason = '신라 로그인 토큰이 없거나 만료되었습니다.';
   } else if (!detailAccessValid) {
-    reason = '상품 상세페이지 보안 세션이 없거나 만료되었습니다. npm run capture:login으로 다시 캡처해 주세요.';
+    reason = USE_LOGIN_PROFILE
+      ? '로컬 Chrome 프로필로 상품 상세페이지 보안 확인을 다시 확인합니다.'
+      : '상품 상세페이지 보안 세션이 없거나 만료되었습니다. npm run capture:login으로 다시 캡처해 주세요.';
   }
 
   const sessionInfo = {
     loginAvailable: true,
     loginTokenValid,
-    loginValid: detailAccessValid,
+    loginValid,
     detailAccessValid,
     needsLogin: !detailAccessValid,
     accountLabel: LOGIN_LABEL || '로그인 세션',
@@ -359,9 +432,14 @@ async function getLoginSessionInfo({ probe = false } = {}) {
 }
 
 async function createMobileContext(browser, { useLogin = false } = {}) {
+  if (useLogin && USE_LOGIN_PROFILE) {
+    return getLoginPersistentContext();
+  }
+
   const device = devices['iPhone 13'] || {};
+  const targetBrowser = browser || (await getBrowser());
   const storageState = useLogin ? getLoginStorageState() : null;
-  const context = await browser.newContext({
+  const context = await targetBrowser.newContext({
     ...device,
     ...(storageState ? { storageState } : {}),
     locale: 'ko-KR',
@@ -375,6 +453,11 @@ async function createMobileContext(browser, { useLogin = false } = {}) {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
   return context;
+}
+
+async function closeMobileContext(context) {
+  if (USE_LOGIN_PROFILE && context === loginPersistentContext) return;
+  await context.close().catch(() => {});
 }
 
 function extractSku(value) {
@@ -860,7 +943,7 @@ async function scrapeShilla(keyword, maxResults = DEFAULT_MAX_RESULTS) {
   try {
     return await scrapeShillaInContext(context, keyword, maxResults);
   } finally {
-    await context.close();
+    await closeMobileContext(context);
   }
 }
 
@@ -1239,9 +1322,9 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
 }
 
 async function scrapeBenefitRows(keyword, maxResults = DEFAULT_BENEFIT_MAX_RESULTS, fallbackItem = {}) {
-  const browser = await getBrowser();
   const sessionInfo = await getLoginSessionInfo();
   const loginApplied = sessionInfo.loginValid;
+  const browser = loginApplied && USE_LOGIN_PROFILE ? null : await getBrowser();
   const context = await createMobileContext(browser, { useLogin: loginApplied });
   const inputSku = extractSku(keyword);
   const normalizedInput = normalizeSearchInput(keyword);
@@ -1282,11 +1365,11 @@ async function scrapeBenefitRows(keyword, maxResults = DEFAULT_BENEFIT_MAX_RESUL
 
     let search = await scrapeShillaInContext(context, keyword, maxResults);
     if (loginApplied && search.items.length === 0) {
-      const guestSearchContext = await createMobileContext(browser);
+      const guestSearchContext = await createMobileContext(browser || (await getBrowser()));
       try {
         search = await scrapeShillaInContext(guestSearchContext, keyword, maxResults);
       } finally {
-        await guestSearchContext.close();
+        await closeMobileContext(guestSearchContext);
       }
     }
 
@@ -1339,7 +1422,7 @@ async function scrapeBenefitRows(keyword, maxResults = DEFAULT_BENEFIT_MAX_RESUL
       items: rows,
     };
   } finally {
-    await context.close();
+    await closeMobileContext(context);
   }
 }
 
@@ -1427,7 +1510,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const sessionInfo = await getLoginSessionInfo();
+      const sessionInfo = await getLoginSessionInfo({ probe: true });
       if (!sessionInfo.loginValid) {
         jsonResponse(res, 428, {
           error: sessionInfo.reason || '로그인 세션이 유효하지 않습니다.',
@@ -1481,6 +1564,10 @@ listenWithPortFallback(PORT);
 
 async function shutdown() {
   server.close();
+  if (loginContextPromise) {
+    const context = await loginContextPromise.catch(() => null);
+    await context?.close().catch(() => {});
+  }
   if (browserPromise) {
     const browser = await browserPromise.catch(() => null);
     await browser?.close().catch(() => {});
