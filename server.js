@@ -7,14 +7,15 @@ import { chromium, devices } from 'playwright';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const publicDir = path.join(__dirname, '..', 'public');
+const appRootDir = path.basename(__dirname) === 'src' ? path.join(__dirname, '..') : __dirname;
+const publicDir = path.join(appRootDir, 'public');
 
 const PORT = Number(process.env.PORT || 3000);
 const SHILLA_ORIGIN = 'https://m.shilladfs.com';
 const SEARCH_PATH = '/estore/kr/ko/search';
 const DEFAULT_MAX_RESULTS = 50;
 const DEFAULT_BENEFIT_MAX_RESULTS = 60;
-const LOGIN_STORAGE_STATE_PATH = process.env.SHILLA_STORAGE_STATE_PATH || path.join(__dirname, '..', '.shilla-storage-state.json');
+const LOGIN_STORAGE_STATE_PATH = process.env.SHILLA_STORAGE_STATE_PATH || path.join(appRootDir, '.shilla-storage-state.json');
 const LOGIN_LABEL = process.env.SHILLA_LOGIN_LABEL || '';
 const LOGIN_COOKIE_NAMES = new Set(['sda_tokenKR', 'shilladfsKRRM']);
 const DETAIL_SECURITY_COOKIE_NAMES = new Set(['cf_clearance', '__cf_bm']);
@@ -197,7 +198,7 @@ async function getLoginStorageStateObject() {
 }
 
 async function probeLoginSessionAccess(sessionInfo) {
-  if (!sessionInfo.loginTokenValid) return sessionInfo;
+  if (!sessionInfo.loginTokenValid || !sessionInfo.detailAccessValid) return sessionInfo;
 
   const now = Date.now();
   if (loginSessionProbeCache && now - loginSessionProbeCache.checkedAt < SESSION_PROBE_TTL_MS) {
