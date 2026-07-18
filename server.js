@@ -18,6 +18,8 @@ const LOGIN_STORAGE_STATE_PATH = process.env.SHILLA_STORAGE_STATE_PATH || path.j
 const LOGIN_LABEL = process.env.SHILLA_LOGIN_LABEL || '';
 const LOGIN_COOKIE_NAMES = new Set(['sda_tokenKR', 'shilladfsKRRM']);
 const DETAIL_SECURITY_COOKIE_NAMES = new Set(['cf_clearance', '__cf_bm']);
+const SESSION_PROBE_URL = `${SHILLA_ORIGIN}/estore/kr/ko/p/5901083`;
+const SESSION_PROBE_TTL_MS = 5 * 60 * 1000;
 const BRAND_QUERY_ALIASES = new Map([
   ['조니워커', 'JOHNNIE WALKER'],
   ['조니 워커', 'JOHNNIE WALKER'],
@@ -26,13 +28,22 @@ const BRAND_QUERY_ALIASES = new Map([
   ['설화수', 'SULWHASOO'],
   ['아이오페', 'IOPE'],
   ['이니스프리', 'INNISFREE'],
-  ['키엘', "KIEHL'S"],
+  ['키엘', 'KIEHLS'],
   ['오쏘물', 'ORTHOMOL'],
   ['오쏘몰', 'ORTHOMOL'],
+]);
+const BRAND_QUERY_VARIANTS = new Map([
+  ['조니워커', ['JOHNNIE WALKER', 'JOHNNIE WALKER BLUE', 'JOHNNIE']],
+  ['조니 워커', ['JOHNNIE WALKER', 'JOHNNIE WALKER BLUE', 'JOHNNIE']],
+  ['키엘', ['KIEHLS', "KIEHL'S", 'KIEHL']],
+  ['헤라', ['HERA']],
+  ['설화수', ['SULWHASOO']],
+  ['아이오페', ['IOPE']],
 ]);
 
 let browserPromise;
 let loginStorageStateCache;
+let loginSessionProbeCache;
 
 function buildSearchUrl(keyword) {
   const url = new URL(`${SHILLA_ORIGIN}${SEARCH_PATH}`);
@@ -57,13 +68,16 @@ function brandSlugFromUrl(value) {
 function normalizeSearchInput(input) {
   const originalQuery = input.trim();
   const productPathMatch = originalQuery.match(/\/p\/(\d+)(?:[/?#]|$)/);
-  const normalizedAlias = BRAND_QUERY_ALIASES.get(originalQuery.replace(/\s+/g, ' ').trim().toLowerCase());
+  const normalizedKey = originalQuery.replace(/\s+/g, ' ').trim().toLowerCase();
+  const aliasVariants = BRAND_QUERY_VARIANTS.get(normalizedKey) || [];
+  const normalizedAlias = aliasVariants[0] || BRAND_QUERY_ALIASES.get(normalizedKey);
 
   if (productPathMatch) {
     return {
       originalQuery,
       query: productPathMatch[1],
       inputType: 'productUrl',
+      aliasVariants: [],
     };
   }
 
@@ -71,6 +85,7 @@ function normalizeSearchInput(input) {
     originalQuery,
     query: normalizedAlias || originalQuery,
     inputType: 'keyword',
+    aliasVariants,
   };
 }
 
@@ -181,7 +196,101 @@ async function getLoginStorageStateObject() {
   return storageState;
 }
 
-async function getLoginSessionInfo() {
+async function probeLoginSessionAccess(sessionInfo) {
+  if (!sessionInfo.loginTokenValid) return sessionInfo;
+
+  const now = Date.now();
+  if (loginSessionProbeCache && now - loginSessionProbeCache.checkedAt < SESSION_PROBE_TTL_MS) {
+    return {
+      ...sessionInfo,
+      ...loginSessionProbeCache.result,
+      probedAt: new Date(loginSessionProbeCache.checkedAt).toISOString(),
+    };
+  }
+
+  const browser = await getBrowser();
+  const context = await createMobileContext(browser, { useLogin: true });
+  const page = await context.newPage();
+
+  try {
+    page.setDefaultTimeout(25000);
+    await gotoAndContinue(page, SESSION_PROBE_URL, { timeout: 20000 });
+    await page.waitForSelector('body', { timeout: 8000 }).catch(() => {});
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const isSecurityCheck = await page
+        .evaluate(() => /보안 확인|잠시만 기다리십시오|cloudflare|verify you are human/i.test(document.body?.innerText || document.title || ''))
+        .catch(() => false);
+      if (!isSecurityCheck) break;
+      await page.waitForTimeout(1500);
+    }
+
+    const probe = await page
+      .evaluate(() => {
+        const text = document.body?.innerText || '';
+        return {
+          blockedBySecurity: /보안 확인|잠시만 기다리십시오|cloudflare|verify you are human/i.test(text || document.title || ''),
+          hasProductDetail: /(최대\s*혜택가|상품\s*할인|장바구니|바로구매|상품정보|상품\s*상세|SKU|스큐)/i.test(text),
+          membershipSignal: /(로그아웃|마이페이지|회원등급|멤버십|골드|gold|실버|silver|블랙|black)/i.test(text),
+          finalUrl: window.location.href,
+        };
+      })
+      .catch((error) => ({
+        blockedBySecurity: true,
+        hasProductDetail: false,
+        membershipSignal: false,
+        finalUrl: page.url(),
+        error: error.message,
+      }));
+
+    let result;
+    if (probe.blockedBySecurity) {
+      result = {
+        loginValid: false,
+        detailAccessValid: false,
+        needsLogin: true,
+        reason:
+          'Render 서버에서 신라 상품 상세페이지 보안 확인을 통과하지 못했습니다. npm run capture:login으로 다시 캡처한 뒤 Render 환경변수를 갱신해 주세요.',
+        probeUrl: probe.finalUrl || page.url(),
+      };
+    } else if (!probe.hasProductDetail) {
+      result = {
+        loginValid: false,
+        detailAccessValid: false,
+        needsLogin: true,
+        reason:
+          'Render 서버에서 신라 상품 상세페이지를 정상 화면으로 확인하지 못했습니다. 로그인 세션을 다시 캡처해 주세요.',
+        probeUrl: probe.finalUrl || page.url(),
+      };
+    } else {
+      result = {
+        loginValid: true,
+        detailAccessValid: true,
+        needsLogin: false,
+        reason: '',
+        probeUrl: probe.finalUrl || page.url(),
+      };
+    }
+
+    loginSessionProbeCache = { checkedAt: now, result };
+    return { ...sessionInfo, ...result, probedAt: new Date(now).toISOString() };
+  } catch (error) {
+    const result = {
+      loginValid: false,
+      detailAccessValid: false,
+      needsLogin: true,
+      reason: `Render 서버에서 신라 상품 상세페이지 확인에 실패했습니다. ${error.message || '로그인 세션을 다시 캡처해 주세요.'}`,
+      probeUrl: page.url(),
+    };
+    loginSessionProbeCache = { checkedAt: now, result };
+    return { ...sessionInfo, ...result, probedAt: new Date(now).toISOString() };
+  } finally {
+    await page.close().catch(() => {});
+    await context.close().catch(() => {});
+  }
+}
+
+async function getLoginSessionInfo({ probe = false } = {}) {
   const storageState = await getLoginStorageStateObject().catch(() => null);
   if (!storageState) {
     return {
@@ -220,7 +329,7 @@ async function getLoginSessionInfo() {
     reason = '상품 상세페이지 보안 세션이 없거나 만료되었습니다. npm run capture:login으로 다시 캡처해 주세요.';
   }
 
-  return {
+  const sessionInfo = {
     loginAvailable: true,
     loginTokenValid,
     loginValid: detailAccessValid,
@@ -231,6 +340,8 @@ async function getLoginSessionInfo() {
     detailSecurityExpiresAt: detailAccessValid && detailSecurityExpiresAt ? new Date(detailSecurityExpiresAt * 1000).toISOString() : '',
     reason,
   };
+
+  return probe ? probeLoginSessionAccess(sessionInfo) : sessionInfo;
 }
 
 async function createMobileContext(browser, { useLogin = false } = {}) {
@@ -254,20 +365,25 @@ async function createMobileContext(browser, { useLogin = false } = {}) {
 
 function extractSku(value) {
   const text = String(value || '');
-  const skuLabelMatch = text.match(/(?:sku|스큐|상품sku|상품\s*sku)\D{0,12}(\d{6,})/i);
+  const skuLabelMatch = text.match(/(?:sku|스큐|상품sku|상품\s*sku)\D{0,12}(\d{12})/i);
   if (skuLabelMatch?.[1]) return skuLabelMatch[1];
 
-  const numericMatch = text.match(/\b\d{8,}\b/);
+  const numericMatch = text.match(/\b\d{12}\b/);
   return numericMatch?.[0] || '';
 }
 
 function brandCodeFromSku(sku) {
   const digits = String(sku || '').replace(/\D/g, '');
-  return digits.length >= 4 ? digits.slice(0, 4) : '';
+  return digits.length === 12 ? digits.slice(0, 4) : '';
 }
 
 function isRealSku(value) {
-  return String(value || '').replace(/\D/g, '').length >= 10;
+  return /^\d{12}$/.test(String(value || '').replace(/\D/g, ''));
+}
+
+function normalizeSkuCandidate(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  return isRealSku(digits) ? digits : '';
 }
 
 async function gotoAndContinue(page, url, { timeout = 25000 } = {}) {
@@ -332,6 +448,81 @@ function hasVisibleProductData(row = {}) {
       row.sPointBenefit ||
       row.otherBenefits,
   );
+}
+
+async function clickDetailControls(page, patternSource, { limit = 8 } = {}) {
+  return page
+    .evaluate(
+      ({ patternSource: source, limit: maxClicks }) => {
+        const pattern = new RegExp(source, 'i');
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const blocked = /(장바구니|바로구매|구매하기|결제|주문|삭제|취소)/;
+        const isVisible = (node) => {
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle(node);
+          return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+        };
+        const closestControl = (node) =>
+          node.closest('button, a, [role="button"], summary, [onclick], .btn, .button') || node;
+        const candidates = Array.from(
+          document.querySelectorAll('button, a, [role="button"], summary, [onclick], .btn, .button, dt, dd, li, span, div'),
+        )
+          .map((node) => {
+            const text = clean([node.textContent, node.getAttribute?.('aria-label'), node.getAttribute?.('title')].join(' '));
+            return { node, text, control: closestControl(node) };
+          })
+          .filter(({ node, text, control }) => text && pattern.test(text) && !blocked.test(text) && isVisible(node) && isVisible(control));
+
+        const clicked = [];
+        const seen = new Set();
+        for (const { control, text } of candidates) {
+          if (clicked.length >= maxClicks) break;
+          if (seen.has(control)) continue;
+          seen.add(control);
+          try {
+            control.click();
+            clicked.push(text.slice(0, 80));
+          } catch {
+            // Keep trying other visible controls.
+          }
+        }
+        return clicked;
+      },
+      { patternSource, limit },
+    )
+    .catch(() => []);
+}
+
+async function prepareProductDetailForBenefits(page) {
+  const interaction = {
+    benefitDetailClicks: [],
+    couponDownloadClicks: [],
+  };
+
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const clicked = await clickDetailControls(page, '최대\\s*혜택가|혜택\\s*(상세|보기|내역)|할인\\s*내역|계산\\s*내역', {
+      limit: 6,
+    });
+    interaction.benefitDetailClicks.push(...clicked);
+    if (!clicked.length) break;
+    await page.waitForTimeout(500);
+  }
+
+  await page.evaluate(() => window.scrollTo(0, Math.floor(document.body.scrollHeight * 0.35))).catch(() => {});
+  await page.waitForTimeout(300);
+
+  const couponClicks = await clickDetailControls(
+    page,
+    '쿠폰\\s*(받기|다운|다운로드)|다운로드\\s*쿠폰|쿠폰\\s*다운로드|받을\\s*수\\s*있는\\s*쿠폰',
+    { limit: 8 },
+  );
+  interaction.couponDownloadClicks.push(...couponClicks);
+  if (couponClicks.length) {
+    await page.waitForTimeout(800);
+  }
+
+  return interaction;
 }
 
 async function settleSearchPage(page, maxResults) {
@@ -565,6 +756,18 @@ async function scrapeShillaInContext(context, keyword, maxResults = DEFAULT_MAX_
       }
     }
 
+    if (extracted.items.length === 0 && input.inputType === 'keyword' && input.aliasVariants?.length > 1) {
+      for (const retryQuery of input.aliasVariants.slice(1)) {
+        if (!retryQuery || retryQuery.toLowerCase() === effectiveQuery.toLowerCase()) continue;
+        effectiveQuery = retryQuery;
+        effectiveSearchUrl = buildSearchUrl(retryQuery);
+        await gotoAndContinue(page, effectiveSearchUrl, { timeout: 25000 });
+        await settleSearchPage(page, maxResults);
+        extracted = await extractCurrentPage();
+        if (extracted.items.length > 0) break;
+      }
+    }
+
     const isLikelySku = /^\d{10,}$/.test(input.originalQuery);
     let noResultMessage = extracted.noResultMessage || '';
 
@@ -631,6 +834,9 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
   }
 
   const page = await context.newPage();
+  page.on('dialog', async (dialog) => {
+    await dialog.accept().catch(() => {});
+  });
 
   try {
     page.setDefaultTimeout(30000);
@@ -648,13 +854,15 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
       .evaluate(() => /보안 확인|잠시만 기다리십시오|cloudflare|verify you are human/i.test(document.body?.innerText || document.title || ''))
       .catch(() => false);
 
+    let detailInteraction = { benefitDetailClicks: [], couponDownloadClicks: [] };
     if (!blockedBySecurity) {
       await page.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
       await page.waitForTimeout(600);
+      detailInteraction = await prepareProductDetailForBenefits(page);
     }
 
     const detail = await page.evaluate(
-      ({ fallback }) => {
+      ({ fallback, interaction }) => {
         const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
         const compactKey = (value) => clean(value).replace(/\s+/g, '').toLowerCase();
         const bodyText = document.body?.innerText || '';
@@ -758,30 +966,35 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
           clean(jsonLd.brand?.name || jsonLd.brand) ||
           fallback.brand;
 
-        const skuWindow = valueNear(['SKU', '상품SKU', '상품 SKU', '스큐', '상품코드', '상품번호'], /\d{6,}/, 3);
+        const validSku = (value) => {
+          const digits = String(value || '').replace(/\D/g, '');
+          return /^\d{12}$/.test(digits) ? digits : '';
+        };
+        const skuWindow = valueNear(['SKU', '상품SKU', '상품 SKU', '스큐'], /\d{12}/, 3);
         const productSku =
-          skuWindow.match(/\d{6,}/)?.[0] ||
-          skuFromImages() ||
-          firstAttr(['[data-sku]', '[data-productsku]', '[data-product-code]', '[data-productcode]'], 'data-sku') ||
-          firstAttr(['[data-productsku]'], 'data-productsku') ||
-          firstAttr(['[data-product-code]'], 'data-product-code') ||
-          firstAttr(['[data-productcode]'], 'data-productcode') ||
-          fallback.productSku;
+          validSku(skuWindow.match(/\d{12}/)?.[0]) ||
+          validSku(skuFromImages()) ||
+          validSku(firstAttr(['[data-sku]', '[data-productsku]'], 'data-sku')) ||
+          validSku(firstAttr(['[data-productsku]'], 'data-productsku')) ||
+          validSku(fallback.productSku);
 
         const maxBenefitBlock = compactBlock(
           ['최대혜택가', '최대 혜택가'],
-          /(수량|장바구니|바로구매|구매하기|상품정보|상품 정보|상품상세|상품 상세|리뷰|고시정보|배송|교환|환불)/i,
-          36,
+          /(수량|장바구니|바로구매|구매하기|상품정보|상품 정보|상품상세|상품 상세|리뷰|고시정보|배송|교환|환불|추천상품)/i,
+          80,
         );
         const benefitLines = (maxBenefitBlock ? maxBenefitBlock.split('|').map(clean) : lines)
           .filter((line) => /(신라|적립|포인트|s\s*point|s포인트|할인|혜택)/i.test(line))
           .slice(0, 40)
           .join(' | ');
-        const maxBenefitPrice = valueForLine(['최대혜택가', '최대 혜택가'], moneyPattern, 8);
-        const productDiscount = valueForLine(['상품 할인', '상품할인', '신라할인', '신라 할인', '할인'], moneyOrRatePattern, 8);
-        const dailyCoupon = valueForLine(['데일리 쿠폰', '데일리쿠폰', '쿠폰'], moneyOrRatePattern, 8);
-        const rewardAmount = valueForLine(['적립금', '신라적립', '신라 적립', '적립'], moneyOrRatePattern, 8);
-        const sPointBenefit = valueForLine(['신라S포인트', '신라 S포인트', 'S포인트', 'S-POINT', 'S POINT', 'S.Point'], moneyOrRatePattern, 8);
+        const ratePattern = /\d+(?:\.\d+)?\s*%/i;
+        const valueForLinePreferRate = (labels, size = 8) =>
+          valueForLine(labels, ratePattern, size) || valueForLine(labels, moneyOrRatePattern, size);
+        const maxBenefitPrice = valueForLine(['최대혜택가', '최대 혜택가'], moneyPattern, 12);
+        const productDiscount = valueForLinePreferRate(['상품 할인', '상품할인', '신라할인', '신라 할인', '할인'], 12);
+        const dailyCoupon = valueForLinePreferRate(['데일리 쿠폰', '데일리쿠폰', '쿠폰'], 12);
+        const rewardAmount = valueForLine(['적립금', '신라적립', '신라 적립', '적립'], moneyOrRatePattern, 12);
+        const sPointBenefit = valueForLine(['신라S포인트', '신라 S포인트', 'S포인트', 'S-POINT', 'S POINT', 'S.Point'], moneyOrRatePattern, 12);
         const knownBenefitLabels = /(최대혜택가|최대 혜택가|상품\s*할인|신라\s*할인|데일리\s*쿠폰|쿠폰|적립금|신라\s*적립|S\s*포인트|S-?POINT|S POINT)/i;
         const otherBenefits = (maxBenefitBlock ? maxBenefitBlock.split('|').map(clean) : [])
           .filter((line) => /(할인|쿠폰|적립|포인트|혜택)/i.test(line) && !knownBenefitLabels.test(line))
@@ -796,10 +1009,17 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
             benefitBreakdown[normalizedLabel] = normalizedValue;
           }
         };
-        const valueInText = (text) => clean(String(text || '').match(moneyOrRatePattern)?.[0] || '');
-        const followingValue = (index) => {
-          for (const line of (maxBenefitBlock ? maxBenefitBlock.split('|').map(clean) : lines).slice(index + 1, index + 4)) {
-            const value = valueInText(line);
+        const valueInText = (text, { preferRate = false } = {}) => {
+          const source = String(text || '');
+          if (preferRate) {
+            const rate = source.match(ratePattern)?.[0];
+            if (rate) return clean(rate);
+          }
+          return clean(source.match(moneyOrRatePattern)?.[0] || '');
+        };
+        const followingValue = (index, options = {}) => {
+          for (const line of (maxBenefitBlock ? maxBenefitBlock.split('|').map(clean) : lines).slice(index + 1, index + 5)) {
+            const value = valueInText(line, options);
             if (value) return value;
           }
           return '';
@@ -814,7 +1034,8 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
         benefitSourceLines.forEach((line, index) => {
           for (const [label, matcher] of benefitLabelMatchers) {
             if (!matcher.test(line)) continue;
-            addBenefit(label, valueInText(line.replace(matcher, '')) || followingValue(index));
+            const preferRate = /할인|쿠폰/.test(label);
+            addBenefit(label, valueInText(line.replace(matcher, ''), { preferRate }) || followingValue(index, { preferRate }));
             break;
           }
         });
@@ -822,7 +1043,7 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
           if (!/(할인|쿠폰|적립|포인트|혜택)/i.test(line) || knownBenefitLabels.test(line) || /최대\s*혜택가/i.test(line)) {
             return;
           }
-          const value = valueInText(line) || followingValue(index);
+          const value = valueInText(line, { preferRate: /할인|쿠폰/.test(line) }) || followingValue(index, { preferRate: /할인|쿠폰/.test(line) });
           const label = clean(line.replace(moneyOrRatePattern, '').replace(/[:：\-]+$/g, '')).slice(0, 30);
           addBenefit(label, value);
         });
@@ -830,6 +1051,8 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
         if (dailyCoupon) addBenefit('데일리 쿠폰', dailyCoupon);
         if (rewardAmount) addBenefit('적립금', rewardAmount);
         if (sPointBenefit) addBenefit('S포인트', sPointBenefit);
+        const couponDownloadText = (interaction?.couponDownloadClicks || []).filter(Boolean).join(' | ');
+        if (couponDownloadText) addBenefit('쿠폰 다운로드', couponDownloadText);
         const membershipLine = lines.find((line) => /(gold|골드|silver|실버|black|블랙|회원등급|멤버십|로그아웃|마이페이지)/i.test(line)) || '';
         const membershipBasis = /gold|골드/i.test(membershipLine)
           ? '로그인(골드)'
@@ -852,9 +1075,10 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
           sPointBenefit,
           otherBenefits,
           benefitBreakdown,
+          couponDownloadText,
           membershipBasis,
           benefitDetailsText: isSecurityCheck
-            ? '상세 페이지가 보안 확인 화면으로 전환되어 목록에서 확인된 값을 보존했습니다.'
+            ? '상세 페이지가 보안 확인 화면으로 전환되어 정확한 혜택을 읽지 못했습니다.'
             : maxBenefitBlock,
           benefitText: isSecurityCheck ? '' : benefitLines,
           isSecurityCheck,
@@ -868,11 +1092,12 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
           productSku: fallbackSku,
           discountRate: item.discountRate || '',
         },
+        interaction: detailInteraction,
       },
     );
 
-    const productSku = detail.productSku || fallbackSku;
-    const normalizedSku = isRealSku(productSku) ? productSku : fallbackSku;
+    const productSku = normalizeSkuCandidate(detail.productSku) || normalizeSkuCandidate(fallbackSku);
+    const normalizedSku = productSku;
 
     return {
       sourceQuery: inputQuery,
@@ -893,8 +1118,8 @@ async function scrapeProductBenefits(context, item, { inputQuery, inputSku, logi
         detail.membershipBasis ||
         (detail.isSecurityCheck
           ? loginApplied
-            ? '로그인 세션 사용(상세 보안확인)'
-            : '비회원(상세 보안확인)'
+            ? '상세 보안 차단'
+            : '비회원(상세 보안차단)'
           : loginApplied
             ? '로그인 세션 사용'
             : '비회원'),
@@ -1015,7 +1240,7 @@ const STATIC_ASSETS = new Map([
   ["/", { type: "text/html; charset=utf-8", body: "<!doctype html>\n<html lang=\"ko\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <title>신라면세점 모바일 상품/혜택 조회</title>\n    <link rel=\"stylesheet\" href=\"/styles.css\" />\n  </head>\n  <body>\n    <main class=\"app\">\n      <section class=\"search-panel\">\n        <div>\n          <h1>신라면세점 모바일 상품/혜택 조회</h1>\n          <p class=\"subtle\">상품명, SKU, 신라 상품 URL을 입력하면 모바일 검색 결과에서 상품 정보를 추출합니다.</p>\n        </div>\n\n        <form id=\"searchForm\" class=\"search-form\">\n          <input\n            id=\"query\"\n            name=\"query\"\n            type=\"search\"\n            autocomplete=\"off\"\n            placeholder=\"예: 라네즈, 5745177, https://m.shilladfs.com/.../p/5786502\"\n            aria-label=\"상품명, SKU, 신라 상품 URL\"\n            required\n          />\n          <button id=\"searchButton\" type=\"submit\">검색</button>\n        </form>\n      </section>\n\n      <section class=\"upload-panel\">\n        <div>\n          <h2>엑셀 일괄 조회</h2>\n        </div>\n        <div class=\"upload-controls\">\n          <input id=\"batchFile\" type=\"file\" accept=\".xlsx,.xls,.csv,.tsv,.txt\" />\n          <button id=\"templateButton\" class=\"secondary-button\" type=\"button\">엑셀 양식 다운로드</button>\n          <button id=\"batchButton\" class=\"secondary-button\" type=\"button\">비회원 목록 조회</button>\n          <button id=\"benefitsButton\" type=\"button\">로그인 혜택 일괄 조회</button>\n        </div>\n      </section>\n\n      <section class=\"status-panel\" aria-live=\"polite\">\n        <div id=\"statusText\">검색어를 입력하세요.</div>\n        <div class=\"status-actions\">\n          <button id=\"downloadButton\" class=\"secondary-button\" type=\"button\" hidden>엑셀 다운로드</button>\n          <a id=\"sourceLink\" class=\"source-link\" href=\"#\" target=\"_blank\" rel=\"noreferrer\" hidden>검색 결과 페이지 열기</a>\n        </div>\n      </section>\n\n      <section class=\"table-wrap\">\n        <table>\n          <thead id=\"resultsHead\">\n            <tr>\n              <th>입력값</th>\n              <th>브랜드코드</th>\n              <th>브랜드</th>\n              <th>상품명</th>\n              <th>상품SKU</th>\n              <th>최대혜택가</th>\n              <th>혜택상세</th>\n              <th>조회기준</th>\n              <th>상품 URL</th>\n            </tr>\n          </thead>\n          <tbody id=\"resultsBody\">\n            <tr class=\"empty-row\">\n              <td colspan=\"9\">아직 조회한 결과가 없습니다.</td>\n            </tr>\n          </tbody>\n        </table>\n      </section>\n    </main>\n\n    <script src=\"https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js\"></script>\n    <script src=\"/app.js\" type=\"module\"></script>\n  </body>\n</html>\n" }],
   ["/index.html", { type: "text/html; charset=utf-8", body: "<!doctype html>\n<html lang=\"ko\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <title>신라면세점 모바일 상품/혜택 조회</title>\n    <link rel=\"stylesheet\" href=\"/styles.css\" />\n  </head>\n  <body>\n    <main class=\"app\">\n      <section class=\"search-panel\">\n        <div>\n          <h1>신라면세점 모바일 상품/혜택 조회</h1>\n          <p class=\"subtle\">상품명, SKU, 신라 상품 URL을 입력하면 모바일 검색 결과에서 상품 정보를 추출합니다.</p>\n        </div>\n\n        <form id=\"searchForm\" class=\"search-form\">\n          <input\n            id=\"query\"\n            name=\"query\"\n            type=\"search\"\n            autocomplete=\"off\"\n            placeholder=\"예: 라네즈, 5745177, https://m.shilladfs.com/.../p/5786502\"\n            aria-label=\"상품명, SKU, 신라 상품 URL\"\n            required\n          />\n          <button id=\"searchButton\" type=\"submit\">검색</button>\n        </form>\n      </section>\n\n      <section class=\"upload-panel\">\n        <div>\n          <h2>엑셀 일괄 조회</h2>\n        </div>\n        <div class=\"upload-controls\">\n          <input id=\"batchFile\" type=\"file\" accept=\".xlsx,.xls,.csv,.tsv,.txt\" />\n          <button id=\"templateButton\" class=\"secondary-button\" type=\"button\">엑셀 양식 다운로드</button>\n          <button id=\"batchButton\" class=\"secondary-button\" type=\"button\">비회원 목록 조회</button>\n          <button id=\"benefitsButton\" type=\"button\">로그인 혜택 일괄 조회</button>\n        </div>\n      </section>\n\n      <section class=\"status-panel\" aria-live=\"polite\">\n        <div id=\"statusText\">검색어를 입력하세요.</div>\n        <div class=\"status-actions\">\n          <button id=\"downloadButton\" class=\"secondary-button\" type=\"button\" hidden>엑셀 다운로드</button>\n          <a id=\"sourceLink\" class=\"source-link\" href=\"#\" target=\"_blank\" rel=\"noreferrer\" hidden>검색 결과 페이지 열기</a>\n        </div>\n      </section>\n\n      <section class=\"table-wrap\">\n        <table>\n          <thead id=\"resultsHead\">\n            <tr>\n              <th>입력값</th>\n              <th>브랜드코드</th>\n              <th>브랜드</th>\n              <th>상품명</th>\n              <th>상품SKU</th>\n              <th>최대혜택가</th>\n              <th>혜택상세</th>\n              <th>조회기준</th>\n              <th>상품 URL</th>\n            </tr>\n          </thead>\n          <tbody id=\"resultsBody\">\n            <tr class=\"empty-row\">\n              <td colspan=\"9\">아직 조회한 결과가 없습니다.</td>\n            </tr>\n          </tbody>\n        </table>\n      </section>\n    </main>\n\n    <script src=\"https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js\"></script>\n    <script src=\"/app.js\" type=\"module\"></script>\n  </body>\n</html>\n" }],
   ["/styles.css", { type: "text/css; charset=utf-8", body: ":root {\n  color-scheme: light;\n  --bg: #f6f7f9;\n  --panel: #ffffff;\n  --text: #1c1d1f;\n  --muted: #6b7280;\n  --line: #d9dde3;\n  --accent: #111827;\n  --accent-hover: #303846;\n  --error: #b42318;\n}\n\n* {\n  box-sizing: border-box;\n}\n\nbody {\n  margin: 0;\n  background: var(--bg);\n  color: var(--text);\n  font-family:\n    system-ui,\n    -apple-system,\n    BlinkMacSystemFont,\n    \"Segoe UI\",\n    sans-serif;\n}\n\n.app {\n  width: min(1180px, calc(100% - 32px));\n  margin: 32px auto;\n}\n\n.search-panel,\n.upload-panel,\n.status-panel,\n.table-wrap {\n  background: var(--panel);\n  border: 1px solid var(--line);\n  border-radius: 8px;\n}\n\n.search-panel {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) minmax(320px, 520px);\n  gap: 24px;\n  align-items: end;\n  padding: 24px;\n}\n\n.upload-panel {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) minmax(320px, 520px);\n  gap: 24px;\n  align-items: end;\n  margin-top: 16px;\n  padding: 20px 24px;\n}\n\nh1 {\n  margin: 0 0 8px;\n  font-size: 24px;\n  line-height: 1.25;\n}\n\nh2 {\n  margin: 0 0 8px;\n  font-size: 18px;\n  line-height: 1.3;\n}\n\n.subtle {\n  margin: 0;\n  color: var(--muted);\n  line-height: 1.5;\n}\n\n.search-form {\n  display: flex;\n  gap: 10px;\n}\n\n.upload-controls {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) repeat(3, auto);\n  gap: 10px;\n}\n\ninput,\nbutton {\n  height: 44px;\n  border-radius: 6px;\n  font: inherit;\n}\n\ninput {\n  width: 100%;\n  border: 1px solid var(--line);\n  padding: 0 12px;\n  background: #fff;\n}\n\ninput[type='file'] {\n  padding: 10px 12px;\n}\n\ninput:focus {\n  outline: 2px solid #9ca3af;\n  outline-offset: 1px;\n}\n\nbutton {\n  min-width: 96px;\n  border: 0;\n  background: var(--accent);\n  color: #fff;\n  cursor: pointer;\n  font-weight: 700;\n}\n\nbutton:hover:not(:disabled) {\n  background: var(--accent-hover);\n}\n\nbutton:disabled {\n  cursor: wait;\n  opacity: 0.65;\n}\n\n.status-panel {\n  display: flex;\n  justify-content: space-between;\n  gap: 16px;\n  align-items: center;\n  margin: 16px 0;\n  padding: 14px 16px;\n  color: var(--muted);\n}\n\n.status-panel.error {\n  color: var(--error);\n}\n\n.source-link {\n  color: var(--accent);\n  font-weight: 700;\n  white-space: nowrap;\n}\n\n.status-actions {\n  display: flex;\n  gap: 10px;\n  align-items: center;\n}\n\n.secondary-button {\n  min-width: auto;\n  height: 34px;\n  padding: 0 12px;\n  border: 1px solid var(--line);\n  background: #fff;\n  color: var(--accent);\n}\n\n.secondary-button:hover:not(:disabled) {\n  background: #f3f4f6;\n}\n\n.upload-controls .secondary-button {\n  height: 44px;\n}\n\n.table-wrap {\n  overflow-x: auto;\n}\n\ntable {\n  width: 100%;\n  border-collapse: collapse;\n  min-width: 2180px;\n}\n\nth,\ntd {\n  padding: 14px 12px;\n  border-bottom: 1px solid var(--line);\n  text-align: left;\n  vertical-align: top;\n  line-height: 1.45;\n}\n\nth {\n  position: sticky;\n  top: 0;\n  background: #f9fafb;\n  color: #374151;\n  font-size: 13px;\n  white-space: nowrap;\n}\n\ntd {\n  font-size: 14px;\n}\n\n.product-name {\n  min-width: 260px;\n  font-weight: 700;\n}\n\n.source-query {\n  min-width: 180px;\n  max-width: 260px;\n  word-break: break-all;\n}\n\n.price {\n  white-space: nowrap;\n}\n\n.url-cell {\n  max-width: 320px;\n  word-break: break-all;\n}\n\n.url-cell a {\n  color: #1f4f99;\n}\n\n.empty-row td {\n  padding: 36px 12px;\n  color: var(--muted);\n  text-align: center;\n}\n\n@media (max-width: 760px) {\n  .app {\n    width: min(100% - 20px, 1180px);\n    margin: 16px auto;\n  }\n\n  .search-panel {\n    grid-template-columns: 1fr;\n    padding: 18px;\n  }\n\n  .upload-panel,\n  .upload-controls {\n    grid-template-columns: 1fr;\n  }\n\n  .search-form,\n  .status-panel {\n    flex-direction: column;\n    align-items: stretch;\n  }\n\n  button {\n    width: 100%;\n  }\n}\n" }],
-  ["/app.js", { type: "text/javascript; charset=utf-8", body: "const form = document.querySelector('#searchForm');\nconst queryInput = document.querySelector('#query');\nconst button = document.querySelector('#searchButton');\nconst statusPanel = document.querySelector('.status-panel');\nconst statusText = document.querySelector('#statusText');\nconst sourceLink = document.querySelector('#sourceLink');\nconst resultsHead = document.querySelector('#resultsHead');\nconst resultsBody = document.querySelector('#resultsBody');\nconst batchFileInput = document.querySelector('#batchFile');\nconst batchButton = document.querySelector('#batchButton');\nconst benefitsButton = document.querySelector('#benefitsButton');\nconst templateButton = document.querySelector('#templateButton');\nconst downloadButton = document.querySelector('#downloadButton');\n\nconst BATCH_MAX_RESULTS_PER_QUERY = 60;\nconst SINGLE_BENEFIT_MAX_RESULTS = 60;\nconst BATCH_BENEFIT_MAX_RESULTS_PER_QUERY = 60;\nconst BATCH_MAX_QUERIES = 200;\nconst DETAIL_LOOKUP_CONCURRENCY = 3;\nconst SEARCH_RESULT_BASIS = '검색결과';\nconst BASE_RESULT_HEADERS = ['입력값', '브랜드코드', '브랜드', '상품명', '상품SKU', '최대혜택가'];\nconst TRAILING_RESULT_HEADERS = ['혜택상세', '조회기준', '상품 URL'];\nconst TEMPLATE_ROWS = [\n  ['입력값'],\n  ['라네즈'],\n  ['102467200030'],\n  ['https://m.shilladfs.com/estore/kr/ko/p/5786502?isSavedId=true'],\n];\nlet latestRows = [];\nlet loginSession = { loginAvailable: false, loginValid: false, accountLabel: '비회원' };\nlet loginPromptShown = false;\n\nconst LOGIN_SETUP_MESSAGE = [\n  '신라면세점 로그인 세션이 유효하지 않습니다.',\n  '',\n  '다시 로그인하는 방법:',\n  '1. Mac 터미널에서 프로젝트 폴더를 엽니다.',\n  '2. npm run capture:login 을 실행합니다.',\n  '3. 열린 Chrome에서 신라면세점에 로그인합니다.',\n  '4. 터미널 안내대로 상품 상세페이지가 정상으로 열린 것까지 확인합니다.',\n  '5. 터미널로 돌아와 Enter를 눌러 세션을 저장합니다.',\n  '6. .shilla-storage-state.base64.txt 내용을 Render 환경변수 SHILLA_STORAGE_STATE_BASE64에 다시 붙여넣고 Save, rebuild, deploy를 누릅니다.',\n].join('\\n');\n\nfunction setStatus(message, { error = false, sourceUrl = '' } = {}) {\n  statusPanel.classList.toggle('error', error);\n  statusText.textContent = message;\n\n  if (sourceUrl) {\n    sourceLink.href = sourceUrl;\n    sourceLink.hidden = false;\n  } else {\n    sourceLink.hidden = true;\n  }\n}\n\nfunction escapeHtml(value) {\n  return String(value || '')\n    .replaceAll('&', '&amp;')\n    .replaceAll('<', '&lt;')\n    .replaceAll('>', '&gt;')\n    .replaceAll('\"', '&quot;')\n    .replaceAll(\"'\", '&#039;');\n}\n\nfunction renderEmpty(message) {\n  latestRows = [];\n  downloadButton.hidden = true;\n  const headers = renderHeaders([]);\n  resultsBody.innerHTML = `\n    <tr class=\"empty-row\">\n      <td colspan=\"${headers.length}\">${escapeHtml(message)}</td>\n    </tr>\n  `;\n}\n\nfunction benefitHeadersForRows(items) {\n  const preferredOrder = ['상품 할인', '데일리 쿠폰', '적립금', 'S포인트'];\n  const headers = new Set();\n\n  for (const item of items) {\n    for (const header of Object.keys(item.benefitBreakdown || {})) {\n      if (header) headers.add(header);\n    }\n    if (item.productDiscount) headers.add('상품 할인');\n    if (item.dailyCoupon) headers.add('데일리 쿠폰');\n    if (item.rewardAmount) headers.add('적립금');\n    if (item.sPointBenefit) headers.add('S포인트');\n    if (item.otherBenefits) headers.add('기타혜택');\n  }\n\n  return [\n    ...preferredOrder.filter((header) => headers.has(header)),\n    ...Array.from(headers).filter((header) => !preferredOrder.includes(header)),\n  ];\n}\n\nfunction resultHeadersForRows(items = []) {\n  return [...BASE_RESULT_HEADERS, ...benefitHeadersForRows(items), ...TRAILING_RESULT_HEADERS];\n}\n\nfunction renderHeaders(items = []) {\n  const headers = resultHeadersForRows(items);\n  resultsHead.innerHTML = `\n    <tr>\n      ${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join('')}\n    </tr>\n  `;\n  return headers;\n}\n\nfunction benefitValueForHeader(item, header) {\n  const benefitBreakdown = item.benefitBreakdown || {};\n  if (benefitBreakdown[header]) return benefitBreakdown[header];\n  if (header === '상품 할인') return item.productDiscount || '';\n  if (header === '데일리 쿠폰') return item.dailyCoupon || '';\n  if (header === '적립금') return item.rewardAmount || '';\n  if (header === 'S포인트') return item.sPointBenefit || '';\n  if (header === '기타혜택') return item.otherBenefits || '';\n  return '';\n}\n\nfunction valueForHeader(item, header) {\n  if (header === '입력값') return item.sourceQuery || '';\n  if (header === '브랜드코드') return item.brandCode || '';\n  if (header === '브랜드') return item.brand || '';\n  if (header === '상품명') return item.productName || '';\n  if (header === '상품SKU') return item.productSku || '';\n  if (header === '최대혜택가') return item.maxBenefitPrice || '';\n  if (header === '혜택상세') return item.benefitDetailsText || item.benefitText || '';\n  if (header === '조회기준') return item.benefitBasis || '';\n  if (header === '상품 URL') return item.productUrl || '';\n  return benefitValueForHeader(item, header);\n}\n\nfunction classForHeader(header) {\n  if (header === '입력값') return 'source-query';\n  if (header === '상품명') return 'product-name';\n  if (header === '상품 URL') return 'url-cell';\n  if (header === '최대혜택가' || /가격|가|할인|쿠폰|적립|포인트|P$/.test(header)) return 'price';\n  return '';\n}\n\nfunction renderRows(items) {\n  const normalizedItems = fillMissingBrandCodes(items);\n  const headers = renderHeaders(normalizedItems);\n  latestRows = normalizedItems;\n  downloadButton.hidden = normalizedItems.length === 0;\n\n  if (!normalizedItems.length) {\n    resultsBody.innerHTML = `\n      <tr class=\"empty-row\">\n        <td colspan=\"${headers.length}\">검색 결과가 없습니다.</td>\n      </tr>\n    `;\n    return;\n  }\n\n  resultsBody.innerHTML = normalizedItems\n    .map((item) => {\n      return `\n        <tr>\n          ${headers\n            .map((header) => {\n              const value = valueForHeader(item, header);\n              const className = classForHeader(header);\n              if (header === '상품 URL' && value) {\n                const url = escapeHtml(value);\n                return `<td class=\"${className}\"><a href=\"${url}\" target=\"_blank\" rel=\"noreferrer\">${url}</a></td>`;\n              }\n              return `<td${className ? ` class=\"${className}\"` : ''}>${escapeHtml(value)}</td>`;\n            })\n            .join('')}\n        </tr>\n      `;\n    })\n    .join('');\n}\n\nfunction setBusy(isBusy) {\n  button.disabled = isBusy;\n  batchButton.disabled = isBusy;\n  benefitsButton.disabled = isBusy;\n  templateButton.disabled = isBusy;\n}\n\nasync function searchShilla(query, maxResults) {\n  const body = maxResults ? { query, maxResults } : { query };\n  const response = await fetch('/api/search', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '검색에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function searchBenefits(query, maxResults = 1, fallbackItem = null) {\n  const body = { query, maxResults };\n  if (fallbackItem) body.fallbackItem = fallbackItem;\n\n  const response = await fetch('/api/benefits', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '혜택 조회에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function readJsonResponse(response) {\n  const text = await response.text();\n  try {\n    return JSON.parse(text);\n  } catch {\n    const message = response.ok\n      ? '서버가 JSON이 아닌 응답을 반환했습니다.'\n      : `서버 오류가 발생했습니다. 상태코드: ${response.status}`;\n    throw new Error(message);\n  }\n}\n\nasync function loadSessionStatus() {\n  try {\n    setStatus('로그인 세션 유효성을 확인 중입니다.');\n    const response = await fetch('/api/session', { cache: 'no-store' });\n    const payload = await response.json();\n    loginSession = payload;\n    if (payload.loginValid) {\n      setStatus(\n        `로그인 세션이 유효합니다. 상단 검색과 로그인 혜택 조회는 ${payload.accountLabel || '로그인'} 기준 상세페이지 값으로 실행됩니다.`,\n      );\n    } else if (payload.loginTokenValid && !payload.detailAccessValid) {\n      setStatus(payload.reason || '상품 상세페이지 보안 세션이 만료되었습니다. 다시 로그인 캡처가 필요합니다.', { error: true });\n      showLoginPrompt(payload);\n    } else {\n      setStatus(payload.reason || '로그인 세션이 없거나 만료되었습니다. 비회원 목록 조회만 가능합니다.', { error: true });\n      showLoginPrompt(payload);\n    }\n  } catch {\n    setStatus('검색어를 입력하세요.');\n  }\n}\n\nfunction showLoginPrompt(payload = loginSession) {\n  if (loginPromptShown) return;\n  loginPromptShown = true;\n  const reason = payload?.reason ? `사유: ${payload.reason}\\n\\n` : '';\n  window.alert(`${reason}${LOGIN_SETUP_MESSAGE}`);\n}\n\nfunction isDirectProductQuery(query) {\n  return /\\/p\\/\\d+(?:[/?#]|$)/.test(String(query || '')) || isRealSku(extractSku(query));\n}\n\nfunction loginBasis(payload) {\n  return payload.loginApplied ? `로그인${payload.accountLabel ? ` (${payload.accountLabel})` : ''}` : '비회원';\n}\n\nasync function collectLoginBenefitRows(query, maxResults, onProgress) {\n  if (isDirectProductQuery(query)) {\n    const payload = await searchBenefits(query, 1);\n    const rows = (payload.items || []).map((item) => normalizeSearchItem(item, query, loginBasis(payload)));\n    return {\n      rows,\n      searchUrl: payload.searchUrl,\n      finalUrl: payload.finalUrl,\n      retrievedAt: payload.retrievedAt,\n    };\n  }\n\n  const listPayload = await searchShilla(query, maxResults);\n  const items = listPayload.items || [];\n  if (!items.length) {\n    return {\n      rows: [\n        {\n          sourceQuery: query,\n          brandCode: brandCodeFromSku(extractSku(query)),\n          brand: '',\n          productName: listPayload.noResultMessage || '검색 결과가 없습니다.',\n          productSku: extractSku(query),\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitDetailsText: '',\n          benefitBasis: '검색 결과 없음',\n          productUrl: '',\n        },\n      ],\n      searchUrl: listPayload.searchUrl,\n      finalUrl: listPayload.finalUrl,\n      retrievedAt: listPayload.retrievedAt,\n    };\n  }\n\n  const detailRowsByIndex = new Array(items.length);\n  let nextIndex = 0;\n  let completed = 0;\n  const workerCount = Math.min(DETAIL_LOOKUP_CONCURRENCY, items.length);\n\n  async function worker() {\n    while (nextIndex < items.length) {\n      const index = nextIndex;\n      nextIndex += 1;\n      const item = items[index];\n      const detailQuery = item.productUrl || item.productSku || item.productName;\n\n      try {\n        const payload = await searchBenefits(detailQuery, 1, item);\n        const rows = (payload.items || []).map((detailItem) => ({\n          ...normalizeSearchItem(detailItem, query, loginBasis(payload)),\n          sourceQuery: query,\n        }));\n        detailRowsByIndex[index] = rows.length ? rows : [normalizeSearchItem(item, query, '상세 결과 없음')];\n      } catch (error) {\n        detailRowsByIndex[index] = [\n          {\n            ...normalizeSearchItem(item, query, '상세 확인 실패'),\n            benefitDetailsText: error.message || '상세 확인 실패',\n          },\n        ];\n      }\n\n      completed += 1;\n      const currentRows = detailRowsByIndex.flat().filter(Boolean);\n      onProgress?.(currentRows, completed, items.length);\n    }\n  }\n\n  await Promise.all(Array.from({ length: workerCount }, () => worker()));\n\n  return {\n    rows: detailRowsByIndex.flat().filter(Boolean),\n    searchUrl: listPayload.searchUrl,\n    finalUrl: listPayload.finalUrl,\n    retrievedAt: new Date().toISOString(),\n  };\n}\n\nfunction extractSku(value) {\n  const text = String(value || '');\n  const skuLabelMatch = text.match(/(?:sku|스큐|상품sku|상품\\s*sku)\\D{0,12}(\\d{6,})/i);\n  if (skuLabelMatch?.[1]) return skuLabelMatch[1];\n  return text.match(/\\b\\d{8,}\\b/)?.[0] || '';\n}\n\nfunction brandCodeFromSku(sku) {\n  const digits = String(sku || '').replace(/\\D/g, '');\n  return digits.length >= 4 ? digits.slice(0, 4) : '';\n}\n\nfunction isRealSku(value) {\n  return String(value || '').replace(/\\D/g, '').length >= 10;\n}\n\nfunction normalizeSearchItem(item, sourceQuery, benefitBasis = SEARCH_RESULT_BASIS) {\n  const sourceSku = extractSku(sourceQuery);\n  const itemSku = isRealSku(item.productSku) ? item.productSku : '';\n  const sku = itemSku || sourceSku;\n  const resolvedBasis =\n    item.benefitBasis && !(item.benefitBasis === '비회원' && benefitBasis.startsWith('로그인'))\n      ? item.benefitBasis\n      : benefitBasis;\n  return {\n    sourceQuery,\n    brandCode: item.brandCode || brandCodeFromSku(sku),\n    brand: item.brand || '',\n    productName: item.productName || '',\n    productSku: sku,\n    productCode: item.productCode || '',\n    salePrice: item.salePrice || '',\n    maxBenefitPrice: item.maxBenefitPrice || item.salePrice || '',\n    productDiscount: item.productDiscount || item.discountRate || '',\n    dailyCoupon: item.dailyCoupon || '',\n    rewardAmount: item.rewardAmount || '',\n    sPointBenefit: item.sPointBenefit || '',\n    otherBenefits: item.otherBenefits || '',\n    benefitBreakdown: item.benefitBreakdown || {},\n    benefitBasis: resolvedBasis,\n    benefitDetailsText: item.benefitDetailsText || '',\n    benefitText: item.benefitText || '',\n    productUrl: item.productUrl || '',\n  };\n}\n\nfunction fillMissingBrandCodes(items) {\n  const brandToCode = new Map();\n\n  for (const item of items) {\n    const brand = String(item.brand || '').trim();\n    const code = String(item.brandCode || brandCodeFromSku(item.productSku)).trim();\n    if (brand && code && !brandToCode.has(brand)) {\n      brandToCode.set(brand, code);\n    }\n  }\n\n  return items.map((item) => {\n    const brand = String(item.brand || '').trim();\n    if (item.brandCode || !brand) return item;\n\n    const inferredCode = brandToCode.get(brand);\n    return inferredCode ? { ...item, brandCode: inferredCode } : item;\n  });\n}\n\nfunction parseDelimitedText(text, delimiter) {\n  const rows = [];\n  let row = [];\n  let cell = '';\n  let quoted = false;\n\n  for (let i = 0; i < text.length; i += 1) {\n    const char = text[i];\n    const next = text[i + 1];\n\n    if (char === '\"' && quoted && next === '\"') {\n      cell += '\"';\n      i += 1;\n    } else if (char === '\"') {\n      quoted = !quoted;\n    } else if (char === delimiter && !quoted) {\n      row.push(cell);\n      cell = '';\n    } else if ((char === '\\n' || char === '\\r') && !quoted) {\n      if (char === '\\r' && next === '\\n') i += 1;\n      row.push(cell);\n      rows.push(row);\n      row = [];\n      cell = '';\n    } else {\n      cell += char;\n    }\n  }\n\n  row.push(cell);\n  rows.push(row);\n  return rows;\n}\n\nfunction normalizeHeader(value) {\n  return String(value || '')\n    .trim()\n    .toLowerCase()\n    .replace(/[\\s_-]+/g, '');\n}\n\nfunction extractQueriesFromRows(rows) {\n  const cleanedRows = rows\n    .map((row) => row.map((cell) => String(cell || '').trim()))\n    .filter((row) => row.some(Boolean));\n\n  if (!cleanedRows.length) return [];\n\n  const headerAliases = new Map([\n    ['입력값', 0],\n    ['검색값', 0],\n    ['검색대상', 0],\n    ['value', 0],\n    ['input', 0],\n    ['상품url', 1],\n    ['url', 1],\n    ['producturl', 1],\n    ['sku', 2],\n    ['스큐', 2],\n    ['상품sku', 2],\n    ['상품코드', 3],\n    ['상품번호', 3],\n    ['productcode', 3],\n    ['검색어', 4],\n    ['keyword', 4],\n    ['query', 4],\n    ['상품명', 5],\n    ['productname', 5],\n    ['브랜드명', 6],\n    ['브랜드', 6],\n    ['brand', 6],\n  ]);\n\n  const headers = cleanedRows[0].map(normalizeHeader);\n  const matchingHeaders = headers\n    .map((header, index) => ({ index, priority: headerAliases.get(header) }))\n    .filter((header) => header.priority !== undefined)\n    .sort((a, b) => a.priority - b.priority);\n\n  const valueIndex = matchingHeaders[0]?.index ?? 0;\n  const dataRows = matchingHeaders.length ? cleanedRows.slice(1) : cleanedRows;\n  const seen = new Set();\n  const queries = [];\n\n  for (const row of dataRows) {\n    const value = (row[valueIndex] || row.find(Boolean) || '').trim();\n    if (!value || seen.has(value)) continue;\n    seen.add(value);\n    queries.push(value);\n    if (queries.length >= BATCH_MAX_QUERIES) break;\n  }\n\n  return queries;\n}\n\nasync function readBatchQueries(file) {\n  const lowerName = file.name.toLowerCase();\n\n  if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {\n    if (!window.XLSX) {\n      throw new Error('엑셀 파일 읽기 모듈을 불러오지 못했습니다. CSV로 저장한 뒤 업로드해 주세요.');\n    }\n\n    const buffer = await file.arrayBuffer();\n    const workbook = window.XLSX.read(buffer, { type: 'array' });\n    const firstSheetName = workbook.SheetNames[0];\n    const sheet = workbook.Sheets[firstSheetName];\n    const rows = window.XLSX.utils.sheet_to_json(sheet, {\n      header: 1,\n      raw: false,\n      defval: '',\n    });\n    return extractQueriesFromRows(rows);\n  }\n\n  const text = await file.text();\n  const delimiter = lowerName.endsWith('.tsv') || text.includes('\\t') ? '\\t' : ',';\n  return extractQueriesFromRows(parseDelimitedText(text, delimiter));\n}\n\nfunction toCsvValue(value) {\n  const text = String(value || '');\n  return /[\",\\n\\r]/.test(text) ? `\"${text.replaceAll('\"', '\"\"')}\"` : text;\n}\n\nfunction downloadTemplate() {\n  if (window.XLSX) {\n    const workbook = window.XLSX.utils.book_new();\n    const sheet = window.XLSX.utils.aoa_to_sheet(TEMPLATE_ROWS);\n    sheet['!cols'] = [{ wch: 70 }];\n    window.XLSX.utils.book_append_sheet(workbook, sheet, '일괄조회양식');\n    window.XLSX.writeFile(workbook, 'shilla-batch-template.xlsx');\n    return;\n  }\n\n  const lines = TEMPLATE_ROWS.map((row) => row.map(toCsvValue).join(','));\n  const blob = new Blob([`\\ufeff${lines.join('\\n')}`], { type: 'text/csv;charset=utf-8' });\n  const url = URL.createObjectURL(blob);\n  const link = document.createElement('a');\n  link.href = url;\n  link.download = 'shilla-batch-template.csv';\n  link.click();\n  URL.revokeObjectURL(url);\n}\n\nfunction downloadCsv() {\n  if (!latestRows.length) return;\n  const exportRows = fillMissingBrandCodes(latestRows);\n  const headers = resultHeadersForRows(exportRows);\n\n  const rows = exportRows.map((row) => {\n    return Object.fromEntries(headers.map((header) => [header, valueForHeader(row, header)]));\n  });\n\n  if (window.XLSX) {\n    const workbook = window.XLSX.utils.book_new();\n    const sheet = window.XLSX.utils.json_to_sheet(rows, { header: headers });\n    sheet['!cols'] = headers.map((header) => ({ wch: header === '혜택상세' || header === '상품 URL' ? 70 : 18 }));\n    window.XLSX.utils.book_append_sheet(workbook, sheet, '조회결과');\n    window.XLSX.writeFile(workbook, `shilla-benefits-${new Date().toISOString().slice(0, 10)}.xlsx`);\n    return;\n  }\n\n  const lines = [\n    headers.map(toCsvValue).join(','),\n    ...rows.map((row) => headers.map((header) => toCsvValue(row[header])).join(',')),\n  ];\n\n  const blob = new Blob([`\\ufeff${lines.join('\\n')}`], { type: 'text/csv;charset=utf-8' });\n  const url = URL.createObjectURL(blob);\n  const link = document.createElement('a');\n  link.href = url;\n  link.download = `shilla-benefits-${new Date().toISOString().slice(0, 10)}.csv`;\n  link.click();\n  URL.revokeObjectURL(url);\n}\n\nform.addEventListener('submit', async (event) => {\n  event.preventDefault();\n\n  const query = queryInput.value.trim();\n  if (!query) return;\n\n  setBusy(true);\n  setStatus('검색 중입니다. 신라면세점 모바일 페이지를 Playwright로 열고 있습니다.');\n  renderEmpty('검색 중입니다.');\n\n  try {\n    if (loginSession.loginValid) {\n      const result = await collectLoginBenefitRows(query, SINGLE_BENEFIT_MAX_RESULTS, (partialRows, completed, total) => {\n        renderRows(partialRows);\n        setStatus(`로그인 상세 혜택 조회 중입니다. ${completed}/${total}: ${query}`);\n      });\n      renderRows(result.rows);\n      const message = result.rows.length\n        ? `${result.rows.length}건의 로그인 상세 혜택을 추출했습니다. 조회 시각: ${new Date(result.retrievedAt).toLocaleString()}`\n        : '검색 결과가 없습니다.';\n      setStatus(message, { sourceUrl: result.finalUrl || result.searchUrl });\n    } else {\n      showLoginPrompt(loginSession);\n      const payload = await searchShilla(query, BATCH_MAX_RESULTS_PER_QUERY);\n\n      renderRows((payload.items || []).map((item) => normalizeSearchItem(item, query, SEARCH_RESULT_BASIS)));\n      const message =\n        payload.count > 0\n          ? `${payload.count}건의 비회원 목록을 추출했습니다. 로그인 세션이 유효하지 않아 상세 혜택 값은 확인하지 않았습니다.`\n          : payload.noResultMessage || '검색 결과가 없습니다.';\n      setStatus(message, { sourceUrl: payload.finalUrl || payload.searchUrl });\n    }\n  } catch (error) {\n    renderEmpty('조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\nbatchButton.addEventListener('click', async () => {\n  const file = batchFileInput.files?.[0];\n  if (!file) {\n    setStatus('엑셀 또는 CSV 파일을 선택하세요.', { error: true });\n    return;\n  }\n\n  if (\n    loginSession.loginValid &&\n    !window.confirm('비회원 목록 조회는 신라 검색결과 목록만 읽습니다. 정확한 회원 기준 상세 혜택은 로그인 혜택 일괄 조회를 사용하세요. 비회원 목록 조회를 계속할까요?')\n  ) {\n    return;\n  }\n\n  setBusy(true);\n  renderEmpty('파일을 읽는 중입니다.');\n  setStatus('파일을 읽는 중입니다.');\n\n  try {\n    const queries = await readBatchQueries(file);\n    if (!queries.length) {\n      throw new Error('파일에서 검색어를 찾지 못했습니다.');\n    }\n\n    const rows = [];\n    for (let i = 0; i < queries.length; i += 1) {\n      const query = queries[i];\n      setStatus(`비회원 목록 조회 중입니다. ${i + 1}/${queries.length}: ${query}`);\n\n      try {\n        const payload = await searchShilla(query, BATCH_MAX_RESULTS_PER_QUERY);\n        if (payload.items?.length) {\n          rows.push(...payload.items.map((item) => normalizeSearchItem(item, query, SEARCH_RESULT_BASIS)));\n        } else {\n          rows.push({\n            sourceQuery: query,\n            brandCode: brandCodeFromSku(extractSku(query)),\n            brand: '',\n            productName: payload.noResultMessage || '검색 결과가 없습니다.',\n            productSku: extractSku(query),\n            productCode: '',\n            guestPrice: '',\n            salePrice: '',\n            maxBenefitPrice: '',\n            productDiscount: '',\n            dailyCoupon: '',\n            rewardAmount: '',\n            sPointBenefit: '',\n            otherBenefits: '',\n            benefitBreakdown: {},\n            benefitBasis: SEARCH_RESULT_BASIS,\n            benefitText: '',\n            productUrl: '',\n          });\n        }\n      } catch (error) {\n        rows.push({\n          sourceQuery: query,\n          brandCode: brandCodeFromSku(extractSku(query)),\n          brand: '',\n          productName: error.message || '조회 실패',\n          productSku: extractSku(query),\n          productCode: '',\n          guestPrice: '',\n          salePrice: '',\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitBasis: SEARCH_RESULT_BASIS,\n          benefitText: '',\n          productUrl: '',\n        });\n      }\n\n      renderRows(rows);\n    }\n\n    setStatus(`${queries.length}개 입력값의 비회원 목록 조회를 완료했습니다. 결과 ${rows.length}행을 추출했습니다.`);\n  } catch (error) {\n    renderEmpty('비회원 목록 조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\nbenefitsButton.addEventListener('click', async () => {\n  const file = batchFileInput.files?.[0];\n  if (!file) {\n    setStatus('엑셀 또는 CSV 파일을 선택하세요.', { error: true });\n    return;\n  }\n\n  if (!loginSession.loginValid) {\n    setStatus(loginSession.reason || '로그인 세션이 유효하지 않아 로그인 혜택 조회를 실행할 수 없습니다.', { error: true });\n    showLoginPrompt(loginSession);\n    return;\n  }\n\n  setBusy(true);\n  renderEmpty('파일을 읽는 중입니다.');\n  setStatus('파일을 읽는 중입니다.');\n\n  try {\n    const queries = await readBatchQueries(file);\n    if (!queries.length) {\n      throw new Error('파일에서 검색어를 찾지 못했습니다.');\n    }\n\n    const rows = [];\n    for (let i = 0; i < queries.length; i += 1) {\n      const query = queries[i];\n      setStatus(`혜택 일괄 조회 중입니다. ${i + 1}/${queries.length}: ${query}`);\n\n      try {\n        const result = await collectLoginBenefitRows(query, BATCH_BENEFIT_MAX_RESULTS_PER_QUERY, (partialRows, completed, total) => {\n          renderRows([...rows, ...partialRows]);\n          setStatus(`혜택 일괄 조회 중입니다. ${i + 1}/${queries.length}: ${query} 상품 ${completed}/${total}`);\n        });\n        rows.push(...result.rows);\n      } catch (error) {\n        rows.push({\n          sourceQuery: query,\n          brandCode: brandCodeFromSku(extractSku(query)),\n          brand: '',\n          productName: error.message || '혜택 조회 실패',\n          productSku: extractSku(query),\n          productCode: '',\n          guestPrice: '',\n          salePrice: '',\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitBasis: '확인 실패',\n          benefitDetailsText: error.message || '혜택 조회 실패',\n          benefitText: '',\n          productUrl: '',\n        });\n      }\n\n      renderRows(rows);\n    }\n\n    setStatus(`${queries.length}개 입력값의 혜택 조회를 완료했습니다. 엑셀 다운로드를 누르면 결과 파일을 받을 수 있습니다.`);\n  } catch (error) {\n    renderEmpty('혜택 일괄 조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\ntemplateButton.addEventListener('click', downloadTemplate);\ndownloadButton.addEventListener('click', downloadCsv);\nrenderHeaders([]);\nloadSessionStatus();\n" }],
+  ["/app.js", { type: "text/javascript; charset=utf-8", body: "const form = document.querySelector('#searchForm');\nconst queryInput = document.querySelector('#query');\nconst button = document.querySelector('#searchButton');\nconst statusPanel = document.querySelector('.status-panel');\nconst statusText = document.querySelector('#statusText');\nconst sourceLink = document.querySelector('#sourceLink');\nconst resultsHead = document.querySelector('#resultsHead');\nconst resultsBody = document.querySelector('#resultsBody');\nconst batchFileInput = document.querySelector('#batchFile');\nconst batchButton = document.querySelector('#batchButton');\nconst benefitsButton = document.querySelector('#benefitsButton');\nconst templateButton = document.querySelector('#templateButton');\nconst downloadButton = document.querySelector('#downloadButton');\n\nconst BATCH_MAX_RESULTS_PER_QUERY = 60;\nconst SINGLE_BENEFIT_MAX_RESULTS = 60;\nconst BATCH_BENEFIT_MAX_RESULTS_PER_QUERY = 60;\nconst BATCH_MAX_QUERIES = 200;\nconst DETAIL_LOOKUP_CONCURRENCY = 1;\nconst SEARCH_RESULT_BASIS = '검색결과';\nconst BASE_RESULT_HEADERS = ['입력값', '브랜드코드', '브랜드', '상품명', '상품SKU', '최대혜택가'];\nconst TRAILING_RESULT_HEADERS = ['혜택상세', '조회기준', '상품 URL'];\nconst TEMPLATE_ROWS = [\n  ['입력값'],\n  ['라네즈'],\n  ['102467200030'],\n  ['https://m.shilladfs.com/estore/kr/ko/p/5786502?isSavedId=true'],\n];\nlet latestRows = [];\nlet loginSession = { loginAvailable: false, loginValid: false, accountLabel: '비회원' };\nlet loginPromptShown = false;\n\nconst LOGIN_SETUP_MESSAGE = [\n  '신라면세점 로그인 세션이 유효하지 않습니다.',\n  '',\n  '다시 로그인하는 방법:',\n  '1. Mac 터미널에서 프로젝트 폴더를 엽니다.',\n  '2. npm run capture:login 을 실행합니다.',\n  '3. 열린 Chrome에서 신라면세점에 로그인합니다.',\n  '4. 터미널 안내대로 상품 상세페이지가 정상으로 열린 것까지 확인합니다.',\n  '5. 터미널로 돌아와 Enter를 눌러 세션을 저장합니다.',\n  '6. .shilla-storage-state.base64.txt 내용을 Render 환경변수 SHILLA_STORAGE_STATE_BASE64에 다시 붙여넣고 Save, rebuild, deploy를 누릅니다.',\n].join('\\n');\n\nfunction setStatus(message, { error = false, sourceUrl = '' } = {}) {\n  statusPanel.classList.toggle('error', error);\n  statusText.textContent = message;\n\n  if (sourceUrl) {\n    sourceLink.href = sourceUrl;\n    sourceLink.hidden = false;\n  } else {\n    sourceLink.hidden = true;\n  }\n}\n\nfunction escapeHtml(value) {\n  return String(value || '')\n    .replaceAll('&', '&amp;')\n    .replaceAll('<', '&lt;')\n    .replaceAll('>', '&gt;')\n    .replaceAll('\"', '&quot;')\n    .replaceAll(\"'\", '&#039;');\n}\n\nfunction renderEmpty(message) {\n  latestRows = [];\n  downloadButton.hidden = true;\n  const headers = renderHeaders([]);\n  resultsBody.innerHTML = `\n    <tr class=\"empty-row\">\n      <td colspan=\"${headers.length}\">${escapeHtml(message)}</td>\n    </tr>\n  `;\n}\n\nfunction benefitHeadersForRows(items) {\n  const preferredOrder = ['상품 할인', '데일리 쿠폰', '쿠폰 다운로드', '적립금', 'S포인트'];\n  const headers = new Set();\n\n  for (const item of items) {\n    for (const header of Object.keys(item.benefitBreakdown || {})) {\n      if (header) headers.add(header);\n    }\n    if (item.productDiscount) headers.add('상품 할인');\n    if (item.dailyCoupon) headers.add('데일리 쿠폰');\n    if (item.rewardAmount) headers.add('적립금');\n    if (item.sPointBenefit) headers.add('S포인트');\n    if (item.otherBenefits) headers.add('기타혜택');\n  }\n\n  return [\n    ...preferredOrder.filter((header) => headers.has(header)),\n    ...Array.from(headers).filter((header) => !preferredOrder.includes(header)),\n  ];\n}\n\nfunction resultHeadersForRows(items = []) {\n  return [...BASE_RESULT_HEADERS, ...benefitHeadersForRows(items), ...TRAILING_RESULT_HEADERS];\n}\n\nfunction renderHeaders(items = []) {\n  const headers = resultHeadersForRows(items);\n  resultsHead.innerHTML = `\n    <tr>\n      ${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join('')}\n    </tr>\n  `;\n  return headers;\n}\n\nfunction benefitValueForHeader(item, header) {\n  const benefitBreakdown = item.benefitBreakdown || {};\n  if (benefitBreakdown[header]) return benefitBreakdown[header];\n  if (header === '상품 할인') return item.productDiscount || '';\n  if (header === '데일리 쿠폰') return item.dailyCoupon || '';\n  if (header === '적립금') return item.rewardAmount || '';\n  if (header === 'S포인트') return item.sPointBenefit || '';\n  if (header === '기타혜택') return item.otherBenefits || '';\n  return '';\n}\n\nfunction valueForHeader(item, header) {\n  if (header === '입력값') return item.sourceQuery || '';\n  if (header === '브랜드코드') return item.brandCode || '';\n  if (header === '브랜드') return item.brand || '';\n  if (header === '상품명') return item.productName || '';\n  if (header === '상품SKU') return item.productSku || '';\n  if (header === '최대혜택가') return item.maxBenefitPrice || '';\n  if (header === '혜택상세') return item.benefitDetailsText || item.benefitText || '';\n  if (header === '조회기준') return item.benefitBasis || '';\n  if (header === '상품 URL') return item.productUrl || '';\n  return benefitValueForHeader(item, header);\n}\n\nfunction classForHeader(header) {\n  if (header === '입력값') return 'source-query';\n  if (header === '상품명') return 'product-name';\n  if (header === '상품 URL') return 'url-cell';\n  if (header === '최대혜택가' || /가격|가|할인|쿠폰|적립|포인트|P$/.test(header)) return 'price';\n  return '';\n}\n\nfunction renderRows(items) {\n  const normalizedItems = fillMissingBrandCodes(items);\n  const headers = renderHeaders(normalizedItems);\n  latestRows = normalizedItems;\n  downloadButton.hidden = normalizedItems.length === 0;\n\n  if (!normalizedItems.length) {\n    resultsBody.innerHTML = `\n      <tr class=\"empty-row\">\n        <td colspan=\"${headers.length}\">검색 결과가 없습니다.</td>\n      </tr>\n    `;\n    return;\n  }\n\n  resultsBody.innerHTML = normalizedItems\n    .map((item) => {\n      return `\n        <tr>\n          ${headers\n            .map((header) => {\n              const value = valueForHeader(item, header);\n              const className = classForHeader(header);\n              if (header === '상품 URL' && value) {\n                const url = escapeHtml(value);\n                return `<td class=\"${className}\"><a href=\"${url}\" target=\"_blank\" rel=\"noreferrer\">${url}</a></td>`;\n              }\n              return `<td${className ? ` class=\"${className}\"` : ''}>${escapeHtml(value)}</td>`;\n            })\n            .join('')}\n        </tr>\n      `;\n    })\n    .join('');\n}\n\nfunction setBusy(isBusy) {\n  button.disabled = isBusy;\n  batchButton.disabled = isBusy;\n  benefitsButton.disabled = isBusy;\n  templateButton.disabled = isBusy;\n}\n\nasync function searchShilla(query, maxResults) {\n  const body = maxResults ? { query, maxResults } : { query };\n  const response = await fetch('/api/search', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '검색에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function searchBenefits(query, maxResults = 1, fallbackItem = null) {\n  const body = { query, maxResults };\n  if (fallbackItem) body.fallbackItem = fallbackItem;\n\n  const response = await fetch('/api/benefits', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '혜택 조회에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function readJsonResponse(response) {\n  const text = await response.text();\n  try {\n    return JSON.parse(text);\n  } catch {\n    const message = response.ok\n      ? '서버가 JSON이 아닌 응답을 반환했습니다.'\n      : `서버 오류가 발생했습니다. 상태코드: ${response.status}`;\n    throw new Error(message);\n  }\n}\n\nasync function loadSessionStatus() {\n  try {\n    setStatus('로그인 세션 유효성을 확인 중입니다.');\n    const response = await fetch('/api/session', { cache: 'no-store' });\n    const payload = await response.json();\n    loginSession = payload;\n    if (payload.loginValid) {\n      setStatus(\n        `로그인 세션이 유효합니다. 상단 검색과 로그인 혜택 조회는 ${payload.accountLabel || '로그인'} 기준 상세페이지 값으로 실행됩니다.`,\n      );\n    } else if (payload.loginTokenValid && !payload.detailAccessValid) {\n      setStatus(payload.reason || '상품 상세페이지 보안 세션이 만료되었습니다. 다시 로그인 캡처가 필요합니다.', { error: true });\n      showLoginPrompt(payload);\n    } else {\n      setStatus(payload.reason || '로그인 세션이 없거나 만료되었습니다. 비회원 목록 조회만 가능합니다.', { error: true });\n      showLoginPrompt(payload);\n    }\n  } catch {\n    setStatus('검색어를 입력하세요.');\n  }\n}\n\nfunction showLoginPrompt(payload = loginSession) {\n  if (loginPromptShown) return;\n  loginPromptShown = true;\n  const reason = payload?.reason ? `사유: ${payload.reason}\\n\\n` : '';\n  window.alert(`${reason}${LOGIN_SETUP_MESSAGE}`);\n}\n\nfunction isDirectProductQuery(query) {\n  return /\\/p\\/\\d+(?:[/?#]|$)/.test(String(query || '')) || isRealSku(extractSku(query));\n}\n\nfunction loginBasis(payload) {\n  return payload.loginApplied ? `로그인${payload.accountLabel ? ` (${payload.accountLabel})` : ''}` : '비회원';\n}\n\nasync function collectLoginBenefitRows(query, maxResults, onProgress) {\n  if (isDirectProductQuery(query)) {\n    const payload = await searchBenefits(query, 1);\n    const rows = (payload.items || []).map((item) => normalizeSearchItem(item, query, loginBasis(payload)));\n    return {\n      rows,\n      searchUrl: payload.searchUrl,\n      finalUrl: payload.finalUrl,\n      retrievedAt: payload.retrievedAt,\n    };\n  }\n\n  const listPayload = await searchShilla(query, maxResults);\n  const items = listPayload.items || [];\n  if (!items.length) {\n    return {\n      rows: [\n        {\n          sourceQuery: query,\n          brandCode: brandCodeFromSku(extractSku(query)),\n          brand: '',\n          productName: listPayload.noResultMessage || '검색 결과가 없습니다.',\n          productSku: extractSku(query),\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitDetailsText: '',\n          benefitBasis: '검색 결과 없음',\n          productUrl: '',\n        },\n      ],\n      searchUrl: listPayload.searchUrl,\n      finalUrl: listPayload.finalUrl,\n      retrievedAt: listPayload.retrievedAt,\n    };\n  }\n\n  const detailRowsByIndex = new Array(items.length);\n  let nextIndex = 0;\n  let completed = 0;\n  const workerCount = Math.min(DETAIL_LOOKUP_CONCURRENCY, items.length);\n\n  async function worker() {\n    while (nextIndex < items.length) {\n      const index = nextIndex;\n      nextIndex += 1;\n      const item = items[index];\n      const detailQuery = item.productUrl || item.productSku || item.productName;\n\n      try {\n        const payload = await searchBenefits(detailQuery, 1, item);\n        const rows = (payload.items || []).map((detailItem) => ({\n          ...normalizeSearchItem(detailItem, query, loginBasis(payload)),\n          sourceQuery: query,\n        }));\n        detailRowsByIndex[index] = rows.length ? rows : [normalizeSearchItem(item, query, '상세 결과 없음')];\n      } catch (error) {\n        detailRowsByIndex[index] = [\n          {\n            ...normalizeSearchItem(item, query, '상세 확인 실패'),\n            benefitDetailsText: error.message || '상세 확인 실패',\n          },\n        ];\n      }\n\n      completed += 1;\n      const currentRows = detailRowsByIndex.flat().filter(Boolean);\n      onProgress?.(currentRows, completed, items.length);\n    }\n  }\n\n  await Promise.all(Array.from({ length: workerCount }, () => worker()));\n\n  return {\n    rows: detailRowsByIndex.flat().filter(Boolean),\n    searchUrl: listPayload.searchUrl,\n    finalUrl: listPayload.finalUrl,\n    retrievedAt: new Date().toISOString(),\n  };\n}\n\nfunction extractSku(value) {\n  const text = String(value || '');\n  const skuLabelMatch = text.match(/(?:sku|스큐|상품sku|상품\\s*sku)\\D{0,12}(\\d{12})/i);\n  if (skuLabelMatch?.[1]) return skuLabelMatch[1];\n  return text.match(/\\b\\d{12}\\b/)?.[0] || '';\n}\n\nfunction brandCodeFromSku(sku) {\n  const digits = String(sku || '').replace(/\\D/g, '');\n  return digits.length === 12 ? digits.slice(0, 4) : '';\n}\n\nfunction isRealSku(value) {\n  return /^\\d{12}$/.test(String(value || '').replace(/\\D/g, ''));\n}\n\nfunction normalizeSearchItem(item, sourceQuery, benefitBasis = SEARCH_RESULT_BASIS) {\n  const sourceSku = extractSku(sourceQuery);\n  const itemSku = isRealSku(item.productSku) ? item.productSku : '';\n  const sku = itemSku || sourceSku;\n  const resolvedBasis =\n    item.benefitBasis && !(item.benefitBasis === '비회원' && benefitBasis.startsWith('로그인'))\n      ? item.benefitBasis\n      : benefitBasis;\n  return {\n    sourceQuery,\n    brandCode: item.brandCode || brandCodeFromSku(sku),\n    brand: item.brand || '',\n    productName: item.productName || '',\n    productSku: sku,\n    productCode: item.productCode || '',\n    salePrice: item.salePrice || '',\n    maxBenefitPrice: item.maxBenefitPrice || item.salePrice || '',\n    productDiscount: item.productDiscount || item.discountRate || '',\n    dailyCoupon: item.dailyCoupon || '',\n    rewardAmount: item.rewardAmount || '',\n    sPointBenefit: item.sPointBenefit || '',\n    otherBenefits: item.otherBenefits || '',\n    benefitBreakdown: item.benefitBreakdown || {},\n    benefitBasis: resolvedBasis,\n    benefitDetailsText: item.benefitDetailsText || '',\n    benefitText: item.benefitText || '',\n    productUrl: item.productUrl || '',\n  };\n}\n\nfunction fillMissingBrandCodes(items) {\n  const brandToCode = new Map();\n\n  for (const item of items) {\n    const brand = String(item.brand || '').trim();\n    const code = String(item.brandCode || brandCodeFromSku(item.productSku)).trim();\n    if (brand && code && !brandToCode.has(brand)) {\n      brandToCode.set(brand, code);\n    }\n  }\n\n  return items.map((item) => {\n    const brand = String(item.brand || '').trim();\n    if (item.brandCode || !brand) return item;\n\n    const inferredCode = brandToCode.get(brand);\n    return inferredCode ? { ...item, brandCode: inferredCode } : item;\n  });\n}\n\nfunction parseDelimitedText(text, delimiter) {\n  const rows = [];\n  let row = [];\n  let cell = '';\n  let quoted = false;\n\n  for (let i = 0; i < text.length; i += 1) {\n    const char = text[i];\n    const next = text[i + 1];\n\n    if (char === '\"' && quoted && next === '\"') {\n      cell += '\"';\n      i += 1;\n    } else if (char === '\"') {\n      quoted = !quoted;\n    } else if (char === delimiter && !quoted) {\n      row.push(cell);\n      cell = '';\n    } else if ((char === '\\n' || char === '\\r') && !quoted) {\n      if (char === '\\r' && next === '\\n') i += 1;\n      row.push(cell);\n      rows.push(row);\n      row = [];\n      cell = '';\n    } else {\n      cell += char;\n    }\n  }\n\n  row.push(cell);\n  rows.push(row);\n  return rows;\n}\n\nfunction normalizeHeader(value) {\n  return String(value || '')\n    .trim()\n    .toLowerCase()\n    .replace(/[\\s_-]+/g, '');\n}\n\nfunction extractQueriesFromRows(rows) {\n  const cleanedRows = rows\n    .map((row) => row.map((cell) => String(cell || '').trim()))\n    .filter((row) => row.some(Boolean));\n\n  if (!cleanedRows.length) return [];\n\n  const headerAliases = new Map([\n    ['입력값', 0],\n    ['검색값', 0],\n    ['검색대상', 0],\n    ['value', 0],\n    ['input', 0],\n    ['상품url', 1],\n    ['url', 1],\n    ['producturl', 1],\n    ['sku', 2],\n    ['스큐', 2],\n    ['상품sku', 2],\n    ['상품코드', 3],\n    ['상품번호', 3],\n    ['productcode', 3],\n    ['검색어', 4],\n    ['keyword', 4],\n    ['query', 4],\n    ['상품명', 5],\n    ['productname', 5],\n    ['브랜드명', 6],\n    ['브랜드', 6],\n    ['brand', 6],\n  ]);\n\n  const headers = cleanedRows[0].map(normalizeHeader);\n  const matchingHeaders = headers\n    .map((header, index) => ({ index, priority: headerAliases.get(header) }))\n    .filter((header) => header.priority !== undefined)\n    .sort((a, b) => a.priority - b.priority);\n\n  const valueIndex = matchingHeaders[0]?.index ?? 0;\n  const dataRows = matchingHeaders.length ? cleanedRows.slice(1) : cleanedRows;\n  const seen = new Set();\n  const queries = [];\n\n  for (const row of dataRows) {\n    const value = (row[valueIndex] || row.find(Boolean) || '').trim();\n    if (!value || seen.has(value)) continue;\n    seen.add(value);\n    queries.push(value);\n    if (queries.length >= BATCH_MAX_QUERIES) break;\n  }\n\n  return queries;\n}\n\nasync function readBatchQueries(file) {\n  const lowerName = file.name.toLowerCase();\n\n  if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {\n    if (!window.XLSX) {\n      throw new Error('엑셀 파일 읽기 모듈을 불러오지 못했습니다. CSV로 저장한 뒤 업로드해 주세요.');\n    }\n\n    const buffer = await file.arrayBuffer();\n    const workbook = window.XLSX.read(buffer, { type: 'array' });\n    const firstSheetName = workbook.SheetNames[0];\n    const sheet = workbook.Sheets[firstSheetName];\n    const rows = window.XLSX.utils.sheet_to_json(sheet, {\n      header: 1,\n      raw: false,\n      defval: '',\n    });\n    return extractQueriesFromRows(rows);\n  }\n\n  const text = await file.text();\n  const delimiter = lowerName.endsWith('.tsv') || text.includes('\\t') ? '\\t' : ',';\n  return extractQueriesFromRows(parseDelimitedText(text, delimiter));\n}\n\nfunction toCsvValue(value) {\n  const text = String(value || '');\n  return /[\",\\n\\r]/.test(text) ? `\"${text.replaceAll('\"', '\"\"')}\"` : text;\n}\n\nfunction downloadTemplate() {\n  if (window.XLSX) {\n    const workbook = window.XLSX.utils.book_new();\n    const sheet = window.XLSX.utils.aoa_to_sheet(TEMPLATE_ROWS);\n    sheet['!cols'] = [{ wch: 70 }];\n    window.XLSX.utils.book_append_sheet(workbook, sheet, '일괄조회양식');\n    window.XLSX.writeFile(workbook, 'shilla-batch-template.xlsx');\n    return;\n  }\n\n  const lines = TEMPLATE_ROWS.map((row) => row.map(toCsvValue).join(','));\n  const blob = new Blob([`\\ufeff${lines.join('\\n')}`], { type: 'text/csv;charset=utf-8' });\n  const url = URL.createObjectURL(blob);\n  const link = document.createElement('a');\n  link.href = url;\n  link.download = 'shilla-batch-template.csv';\n  link.click();\n  URL.revokeObjectURL(url);\n}\n\nfunction downloadCsv() {\n  if (!latestRows.length) return;\n  const exportRows = fillMissingBrandCodes(latestRows);\n  const headers = resultHeadersForRows(exportRows);\n\n  const rows = exportRows.map((row) => {\n    return Object.fromEntries(headers.map((header) => [header, valueForHeader(row, header)]));\n  });\n\n  if (window.XLSX) {\n    const workbook = window.XLSX.utils.book_new();\n    const sheet = window.XLSX.utils.json_to_sheet(rows, { header: headers });\n    sheet['!cols'] = headers.map((header) => ({ wch: header === '혜택상세' || header === '상품 URL' ? 70 : 18 }));\n    window.XLSX.utils.book_append_sheet(workbook, sheet, '조회결과');\n    window.XLSX.writeFile(workbook, `shilla-benefits-${new Date().toISOString().slice(0, 10)}.xlsx`);\n    return;\n  }\n\n  const lines = [\n    headers.map(toCsvValue).join(','),\n    ...rows.map((row) => headers.map((header) => toCsvValue(row[header])).join(',')),\n  ];\n\n  const blob = new Blob([`\\ufeff${lines.join('\\n')}`], { type: 'text/csv;charset=utf-8' });\n  const url = URL.createObjectURL(blob);\n  const link = document.createElement('a');\n  link.href = url;\n  link.download = `shilla-benefits-${new Date().toISOString().slice(0, 10)}.csv`;\n  link.click();\n  URL.revokeObjectURL(url);\n}\n\nform.addEventListener('submit', async (event) => {\n  event.preventDefault();\n\n  const query = queryInput.value.trim();\n  if (!query) return;\n\n  setBusy(true);\n  setStatus('검색 중입니다. 신라면세점 모바일 페이지를 Playwright로 열고 있습니다.');\n  renderEmpty('검색 중입니다.');\n\n  try {\n    if (loginSession.loginValid) {\n      const result = await collectLoginBenefitRows(query, SINGLE_BENEFIT_MAX_RESULTS, (partialRows, completed, total) => {\n        renderRows(partialRows);\n        setStatus(`로그인 상세 혜택 조회 중입니다. ${completed}/${total}: ${query}`);\n      });\n      renderRows(result.rows);\n      const message = result.rows.length\n        ? `${result.rows.length}건의 로그인 상세 혜택을 추출했습니다. 조회 시각: ${new Date(result.retrievedAt).toLocaleString()}`\n        : '검색 결과가 없습니다.';\n      setStatus(message, { sourceUrl: result.finalUrl || result.searchUrl });\n    } else {\n      showLoginPrompt(loginSession);\n      const payload = await searchShilla(query, BATCH_MAX_RESULTS_PER_QUERY);\n\n      renderRows((payload.items || []).map((item) => normalizeSearchItem(item, query, SEARCH_RESULT_BASIS)));\n      const message =\n        payload.count > 0\n          ? `${payload.count}건의 비회원 목록을 추출했습니다. 로그인 세션이 유효하지 않아 상세 혜택 값은 확인하지 않았습니다.`\n          : payload.noResultMessage || '검색 결과가 없습니다.';\n      setStatus(message, { sourceUrl: payload.finalUrl || payload.searchUrl });\n    }\n  } catch (error) {\n    renderEmpty('조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\nbatchButton.addEventListener('click', async () => {\n  const file = batchFileInput.files?.[0];\n  if (!file) {\n    setStatus('엑셀 또는 CSV 파일을 선택하세요.', { error: true });\n    return;\n  }\n\n  if (\n    loginSession.loginValid &&\n    !window.confirm('비회원 목록 조회는 신라 검색결과 목록만 읽습니다. 정확한 회원 기준 상세 혜택은 로그인 혜택 일괄 조회를 사용하세요. 비회원 목록 조회를 계속할까요?')\n  ) {\n    return;\n  }\n\n  setBusy(true);\n  renderEmpty('파일을 읽는 중입니다.');\n  setStatus('파일을 읽는 중입니다.');\n\n  try {\n    const queries = await readBatchQueries(file);\n    if (!queries.length) {\n      throw new Error('파일에서 검색어를 찾지 못했습니다.');\n    }\n\n    const rows = [];\n    for (let i = 0; i < queries.length; i += 1) {\n      const query = queries[i];\n      setStatus(`비회원 목록 조회 중입니다. ${i + 1}/${queries.length}: ${query}`);\n\n      try {\n        const payload = await searchShilla(query, BATCH_MAX_RESULTS_PER_QUERY);\n        if (payload.items?.length) {\n          rows.push(...payload.items.map((item) => normalizeSearchItem(item, query, SEARCH_RESULT_BASIS)));\n        } else {\n          rows.push({\n            sourceQuery: query,\n            brandCode: brandCodeFromSku(extractSku(query)),\n            brand: '',\n            productName: payload.noResultMessage || '검색 결과가 없습니다.',\n            productSku: extractSku(query),\n            productCode: '',\n            guestPrice: '',\n            salePrice: '',\n            maxBenefitPrice: '',\n            productDiscount: '',\n            dailyCoupon: '',\n            rewardAmount: '',\n            sPointBenefit: '',\n            otherBenefits: '',\n            benefitBreakdown: {},\n            benefitBasis: SEARCH_RESULT_BASIS,\n            benefitText: '',\n            productUrl: '',\n          });\n        }\n      } catch (error) {\n        rows.push({\n          sourceQuery: query,\n          brandCode: brandCodeFromSku(extractSku(query)),\n          brand: '',\n          productName: error.message || '조회 실패',\n          productSku: extractSku(query),\n          productCode: '',\n          guestPrice: '',\n          salePrice: '',\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitBasis: SEARCH_RESULT_BASIS,\n          benefitText: '',\n          productUrl: '',\n        });\n      }\n\n      renderRows(rows);\n    }\n\n    setStatus(`${queries.length}개 입력값의 비회원 목록 조회를 완료했습니다. 결과 ${rows.length}행을 추출했습니다.`);\n  } catch (error) {\n    renderEmpty('비회원 목록 조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\nbenefitsButton.addEventListener('click', async () => {\n  const file = batchFileInput.files?.[0];\n  if (!file) {\n    setStatus('엑셀 또는 CSV 파일을 선택하세요.', { error: true });\n    return;\n  }\n\n  if (!loginSession.loginValid) {\n    setStatus(loginSession.reason || '로그인 세션이 유효하지 않아 로그인 혜택 조회를 실행할 수 없습니다.', { error: true });\n    showLoginPrompt(loginSession);\n    return;\n  }\n\n  setBusy(true);\n  renderEmpty('파일을 읽는 중입니다.');\n  setStatus('파일을 읽는 중입니다.');\n\n  try {\n    const queries = await readBatchQueries(file);\n    if (!queries.length) {\n      throw new Error('파일에서 검색어를 찾지 못했습니다.');\n    }\n\n    const rows = [];\n    for (let i = 0; i < queries.length; i += 1) {\n      const query = queries[i];\n      setStatus(`혜택 일괄 조회 중입니다. ${i + 1}/${queries.length}: ${query}`);\n\n      try {\n        const result = await collectLoginBenefitRows(query, BATCH_BENEFIT_MAX_RESULTS_PER_QUERY, (partialRows, completed, total) => {\n          renderRows([...rows, ...partialRows]);\n          setStatus(`혜택 일괄 조회 중입니다. ${i + 1}/${queries.length}: ${query} 상품 ${completed}/${total}`);\n        });\n        rows.push(...result.rows);\n      } catch (error) {\n        rows.push({\n          sourceQuery: query,\n          brandCode: brandCodeFromSku(extractSku(query)),\n          brand: '',\n          productName: error.message || '혜택 조회 실패',\n          productSku: extractSku(query),\n          productCode: '',\n          guestPrice: '',\n          salePrice: '',\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitBasis: '확인 실패',\n          benefitDetailsText: error.message || '혜택 조회 실패',\n          benefitText: '',\n          productUrl: '',\n        });\n      }\n\n      renderRows(rows);\n    }\n\n    setStatus(`${queries.length}개 입력값의 혜택 조회를 완료했습니다. 엑셀 다운로드를 누르면 결과 파일을 받을 수 있습니다.`);\n  } catch (error) {\n    renderEmpty('혜택 일괄 조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\ntemplateButton.addEventListener('click', downloadTemplate);\ndownloadButton.addEventListener('click', downloadCsv);\nrenderHeaders([]);\nloadSessionStatus();\n" }],
 ]);
 
 async function serveStatic(req, res) {
@@ -1049,7 +1274,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (requestUrl.pathname === '/api/session') {
-      jsonResponse(res, 200, await getLoginSessionInfo());
+      jsonResponse(res, 200, await getLoginSessionInfo({ probe: true }));
       return;
     }
 

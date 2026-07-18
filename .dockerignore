@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+.DS_Store
+.env
+.env.*
+.shilla-storage-state.json
+.shilla-storage-state.base64.txt
+playwright-report
+test-results

@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+playwright-report/
+test-results/
+*.log
+.shilla-storage-state.json
+.shilla-storage-state.base64.txt
