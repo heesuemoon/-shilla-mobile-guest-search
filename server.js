@@ -11,6 +11,9 @@ const appRootDir = path.basename(__dirname) === 'src' ? path.join(__dirname, '..
 const publicDir = path.join(appRootDir, 'public');
 
 const PORT = Number(process.env.PORT || 3000);
+const IS_HOSTED_RUNTIME = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID);
+const HEADLESS =
+  process.env.HEADLESS === 'true' ? true : process.env.HEADLESS === 'false' ? false : IS_HOSTED_RUNTIME;
 const SHILLA_ORIGIN = 'https://m.shilladfs.com';
 const SEARCH_PATH = '/estore/kr/ko/search';
 const DEFAULT_MAX_RESULTS = 50;
@@ -127,7 +130,7 @@ async function getBrowser() {
 
 async function launchBrowser() {
   const baseOptions = {
-    headless: process.env.HEADLESS !== 'false',
+    headless: HEADLESS,
     args: ['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--no-sandbox'],
   };
 
@@ -253,13 +256,14 @@ async function probeLoginSessionAccess(sessionInfo) {
 
     let result;
     if (probe.blockedBySecurity) {
+      const blockedRuntime = IS_HOSTED_RUNTIME ? 'Render 서버' : '로컬 Chrome 자동 브라우저';
       result = {
         loginValid: false,
         detailAccessValid: false,
         needsLogin: true,
-        renderSecurityBlocked: true,
-        reason:
-          'Render 서버에서 신라 상품 상세페이지 보안 확인을 통과하지 못했습니다. 로그인 쿠키는 등록됐지만 신라 보안이 Render 서버 접속을 막는 상태입니다.',
+        renderSecurityBlocked: IS_HOSTED_RUNTIME,
+        localSecurityBlocked: !IS_HOSTED_RUNTIME,
+        reason: `${blockedRuntime}에서 신라 상품 상세페이지 보안 확인을 통과하지 못했습니다. 로그인 쿠키는 등록됐지만 신라 보안 확인을 다시 통과해야 합니다.`,
         probeUrl: probe.finalUrl || page.url(),
       };
     } else if (!probe.hasProductDetail) {
@@ -284,11 +288,12 @@ async function probeLoginSessionAccess(sessionInfo) {
     loginSessionProbeCache = { checkedAt: now, result };
     return { ...sessionInfo, ...result, probedAt: new Date(now).toISOString() };
   } catch (error) {
+    const blockedRuntime = IS_HOSTED_RUNTIME ? 'Render 서버' : '로컬 Chrome 자동 브라우저';
     const result = {
       loginValid: false,
       detailAccessValid: false,
       needsLogin: true,
-      reason: `Render 서버에서 신라 상품 상세페이지 확인에 실패했습니다. ${error.message || '로그인 세션을 다시 캡처해 주세요.'}`,
+      reason: `${blockedRuntime}에서 신라 상품 상세페이지 확인에 실패했습니다. ${error.message || '로그인 세션을 다시 캡처해 주세요.'}`,
       probeUrl: page.url(),
     };
     loginSessionProbeCache = { checkedAt: now, result };
@@ -1449,9 +1454,26 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Shilla guest search app: http://localhost:${PORT}`);
-});
+function listenWithPortFallback(port, attempt = 0) {
+  server.removeAllListeners('error');
+  server.once('error', (error) => {
+    if (error.code === 'EADDRINUSE' && !process.env.PORT && attempt < 10) {
+      const nextPort = port + 1;
+      console.log(`Port ${port} is already in use. Trying http://localhost:${nextPort}`);
+      listenWithPortFallback(nextPort, attempt + 1);
+      return;
+    }
+
+    throw error;
+  });
+
+  server.listen(port, () => {
+    console.log(`Shilla guest search app: http://localhost:${port}`);
+    console.log(`Browser mode: ${HEADLESS ? 'headless' : 'visible Chrome'}`);
+  });
+}
+
+listenWithPortFallback(PORT);
 
 async function shutdown() {
   server.close();
