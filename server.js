@@ -84,6 +84,40 @@ let loginPersistentContext;
 let loginStorageStateCache;
 let loginSessionProbeCache;
 
+function isClosedTargetError(error) {
+  return /target page, context or browser has been closed|browser has been closed|context.*closed|browser.*closed/i.test(
+    String(error?.message || error || ''),
+  );
+}
+
+function rememberBrowser(browser) {
+  browser.on('disconnected', () => {
+    browserPromise = undefined;
+  });
+  return browser;
+}
+
+async function isLoginPersistentContextUsable(context) {
+  if (!context) return false;
+  try {
+    context.pages();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function rememberLoginPersistentContext(context) {
+  context.on('close', () => {
+    if (loginPersistentContext === context) {
+      loginPersistentContext = undefined;
+      loginContextPromise = undefined;
+      loginSessionProbeCache = undefined;
+    }
+  });
+  return context;
+}
+
 function buildSearchUrl(keyword) {
   const url = new URL(`${SHILLA_ORIGIN}${SEARCH_PATH}`);
   url.searchParams.set('text', keyword);
@@ -192,6 +226,12 @@ async function readJsonBody(req) {
 }
 
 async function getBrowser() {
+  if (browserPromise) {
+    const browser = await browserPromise.catch(() => null);
+    if (browser?.isConnected?.()) return browser;
+    browserPromise = undefined;
+  }
+
   if (!browserPromise) {
     browserPromise = launchBrowser().catch((error) => {
       browserPromise = undefined;
@@ -208,7 +248,7 @@ async function launchBrowser() {
   };
 
   try {
-    return await chromium.launch(baseOptions);
+    return rememberBrowser(await chromium.launch(baseOptions));
   } catch (bundledBrowserError) {
     const fallbackOptions = [];
     const macChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -225,7 +265,7 @@ async function launchBrowser() {
 
     for (const fallback of fallbackOptions) {
       try {
-        return await chromium.launch({ ...baseOptions, ...fallback });
+        return rememberBrowser(await chromium.launch({ ...baseOptions, ...fallback }));
       } catch {
         // Try the next configured browser source.
       }
@@ -273,10 +313,18 @@ async function launchPersistentLoginContext() {
 }
 
 async function getLoginPersistentContext() {
+  if (loginContextPromise) {
+    const context = await loginContextPromise.catch(() => null);
+    if (await isLoginPersistentContextUsable(context)) return context;
+    loginContextPromise = undefined;
+    loginPersistentContext = undefined;
+    loginSessionProbeCache = undefined;
+  }
+
   if (!loginContextPromise) {
     loginContextPromise = launchPersistentLoginContext()
       .then(async (context) => {
-        loginPersistentContext = context;
+        loginPersistentContext = rememberLoginPersistentContext(context);
         await context.addInitScript(() => {
           Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         });
@@ -286,7 +334,7 @@ async function getLoginPersistentContext() {
           await context.addCookies(storageState.cookies).catch(() => {});
         }
 
-        return context;
+        return loginPersistentContext;
       })
       .catch((error) => {
         loginContextPromise = undefined;
@@ -508,16 +556,33 @@ async function createMobileContext(browser, { useLogin = false } = {}) {
   const device = devices['iPhone 13'] || {};
   const targetBrowser = browser || (await getBrowser());
   const storageState = useLogin ? getLoginStorageState() : null;
-  const context = await targetBrowser.newContext({
-    ...device,
-    ...(storageState ? { storageState } : {}),
-    locale: 'ko-KR',
-    timezoneId: 'Asia/Seoul',
-    ignoreHTTPSErrors: true,
-    extraHTTPHeaders: {
-      'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-    },
-  });
+  let context;
+  try {
+    context = await targetBrowser.newContext({
+      ...device,
+      ...(storageState ? { storageState } : {}),
+      locale: 'ko-KR',
+      timezoneId: 'Asia/Seoul',
+      ignoreHTTPSErrors: true,
+      extraHTTPHeaders: {
+        'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+      },
+    });
+  } catch (error) {
+    if (!isClosedTargetError(error)) throw error;
+    browserPromise = undefined;
+    const freshBrowser = await getBrowser();
+    context = await freshBrowser.newContext({
+      ...device,
+      ...(storageState ? { storageState } : {}),
+      locale: 'ko-KR',
+      timezoneId: 'Asia/Seoul',
+      ignoreHTTPSErrors: true,
+      extraHTTPHeaders: {
+        'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+      },
+    });
+  }
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
