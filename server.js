@@ -1456,6 +1456,7 @@ const server = createServer(async (req, res) => {
 
 function listenWithPortFallback(port, attempt = 0) {
   server.removeAllListeners('error');
+  server.removeAllListeners('listening');
   server.once('error', (error) => {
     if (error.code === 'EADDRINUSE' && !process.env.PORT && attempt < 10) {
       const nextPort = port + 1;
@@ -1467,10 +1468,13 @@ function listenWithPortFallback(port, attempt = 0) {
     throw error;
   });
 
-  server.listen(port, () => {
-    console.log(`Shilla guest search app: http://localhost:${port}`);
+  server.once('listening', () => {
+    const address = server.address();
+    const actualPort = typeof address === 'object' && address ? address.port : port;
+    console.log(`Shilla guest search app: http://localhost:${actualPort}`);
     console.log(`Browser mode: ${HEADLESS ? 'headless' : 'visible Chrome'}`);
   });
+  server.listen(port);
 }
 
 listenWithPortFallback(PORT);
