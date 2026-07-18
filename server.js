@@ -238,7 +238,10 @@ async function getBrowser() {
       throw error;
     });
   }
-  return browserPromise;
+  const browser = await browserPromise;
+  if (browser?.isConnected?.()) return browser;
+  browserPromise = undefined;
+  return getBrowser();
 }
 
 async function launchBrowser() {
@@ -554,34 +557,36 @@ async function createMobileContext(browser, { useLogin = false } = {}) {
   }
 
   const device = devices['iPhone 13'] || {};
-  const targetBrowser = browser || (await getBrowser());
   const storageState = useLogin ? getLoginStorageState() : null;
+  const contextOptions = {
+    ...device,
+    ...(storageState ? { storageState } : {}),
+    locale: 'ko-KR',
+    timezoneId: 'Asia/Seoul',
+    ignoreHTTPSErrors: true,
+    extraHTTPHeaders: {
+      'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    },
+  };
+
   let context;
-  try {
-    context = await targetBrowser.newContext({
-      ...device,
-      ...(storageState ? { storageState } : {}),
-      locale: 'ko-KR',
-      timezoneId: 'Asia/Seoul',
-      ignoreHTTPSErrors: true,
-      extraHTTPHeaders: {
-        'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-      },
-    });
-  } catch (error) {
-    if (!isClosedTargetError(error)) throw error;
-    browserPromise = undefined;
-    const freshBrowser = await getBrowser();
-    context = await freshBrowser.newContext({
-      ...device,
-      ...(storageState ? { storageState } : {}),
-      locale: 'ko-KR',
-      timezoneId: 'Asia/Seoul',
-      ignoreHTTPSErrors: true,
-      extraHTTPHeaders: {
-        'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-      },
-    });
+  let lastClosedError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const targetBrowser = attempt === 0 && browser?.isConnected?.() ? browser : await getBrowser();
+    try {
+      context = await targetBrowser.newContext(contextOptions);
+      break;
+    } catch (error) {
+      if (!isClosedTargetError(error)) throw error;
+      lastClosedError = error;
+      browserPromise = undefined;
+    }
+  }
+
+  if (!context) {
+    throw new Error(
+      `자동 Chrome이 닫혀 조회를 시작하지 못했습니다. 터미널에서 npm start를 Ctrl+C로 끄고 다시 실행해 주세요. (${lastClosedError?.message || 'browser closed'})`,
+    );
   }
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -1846,8 +1851,11 @@ const server = createServer(async (req, res) => {
 
     await serveStatic(req, res);
   } catch (error) {
+    const isClosedBrowser = isClosedTargetError(error);
     jsonResponse(res, 500, {
-      error: error.message || '검색 중 오류가 발생했습니다.',
+      error: isClosedBrowser
+        ? '자동 Chrome이 닫혀 조회를 중단했습니다. 터미널에서 npm start를 Ctrl+C로 끄고 다시 실행한 뒤, 마지막에 뜨는 localhost 주소로 다시 들어가세요.'
+        : error.message || '검색 중 오류가 발생했습니다.',
     });
   }
 });
