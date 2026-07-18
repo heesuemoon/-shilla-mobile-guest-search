@@ -6,3 +6,4 @@ test-results/
 .shilla-storage-state.json
 .shilla-storage-state.base64.txt
 .shilla-chrome-profile/
+.shilla-chrome-profile-desktop/

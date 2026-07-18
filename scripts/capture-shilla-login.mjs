@@ -2,17 +2,18 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
 import { createInterface } from 'node:readline/promises';
-import { chromium, devices } from 'playwright';
+import { chromium } from 'playwright';
 
 const statePath = path.resolve(process.env.SHILLA_STORAGE_STATE_PATH || '.shilla-storage-state.json');
 const base64Path = path.resolve('.shilla-storage-state.base64.txt');
-const profileDir = path.resolve(process.env.SHILLA_PROFILE_DIR || '.shilla-chrome-profile');
+const profileDir = path.resolve(process.env.SHILLA_PROFILE_DIR || '.shilla-chrome-profile-desktop');
 const verifyUrl = process.env.SHILLA_LOGIN_VERIFY_URL || 'https://m.shilladfs.com/estore/kr/ko/p/5621582';
 
 async function launchLoginContext() {
   const options = {
-    ...(devices['iPhone 13'] || {}),
     headless: false,
+    viewport: { width: 1280, height: 900 },
+    screen: { width: 1280, height: 900 },
     locale: 'ko-KR',
     timezoneId: 'Asia/Seoul',
     ignoreHTTPSErrors: true,
