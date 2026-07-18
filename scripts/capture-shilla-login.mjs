@@ -40,11 +40,19 @@ const context = await launchLoginContext().catch((error) => {
   process.exit(1);
 });
 
-const page = await context.newPage();
-await page.goto('https://m.shilladfs.com/estore/kr/ko/', {
-  waitUntil: 'domcontentloaded',
-  timeout: 45000,
-});
+const page = context.pages()[0] || (await context.newPage());
+await page
+  .goto('https://m.shilladfs.com/estore/kr/ko/', {
+    waitUntil: 'domcontentloaded',
+    timeout: 45000,
+  })
+  .catch((error) => {
+    console.log('');
+    console.log('신라면세점 첫 화면을 자동으로 열지 못했습니다.');
+    console.log('열린 Chrome 주소창에 아래 주소를 직접 붙여넣으세요.');
+    console.log('https://m.shilladfs.com/estore/kr/ko/');
+    console.log(error.message || error);
+  });
 
 console.log('');
 console.log('열린 Chrome 창에서 신라면세점에 로그인하세요.');
@@ -63,7 +71,13 @@ console.log('');
 await page.goto(verifyUrl, {
   waitUntil: 'domcontentloaded',
   timeout: 45000,
-}).catch(() => {});
+}).catch((error) => {
+  console.log('');
+  console.log('상품 상세페이지를 자동으로 열지 못했습니다.');
+  console.log('열린 Chrome 주소창에 아래 주소를 직접 붙여넣으세요.');
+  console.log(verifyUrl);
+  console.log(error.message || error);
+});
 await page.waitForSelector('body', { timeout: 15000 }).catch(() => {});
 await rl.question('상품 상세 화면이 보이면 Enter: ');
 rl.close();
