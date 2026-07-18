@@ -15,6 +15,8 @@ const IS_HOSTED_RUNTIME = process.env.NODE_ENV === 'production' || Boolean(proce
 const HEADLESS =
   process.env.HEADLESS === 'true' ? true : process.env.HEADLESS === 'false' ? false : IS_HOSTED_RUNTIME;
 const SHILLA_ORIGIN = 'https://m.shilladfs.com';
+const LOTTE_ORIGIN = 'https://kor.lottedfs.com';
+const SSG_ORIGIN = 'https://www.ssgdfs.com';
 const SEARCH_PATH = '/estore/kr/ko/search';
 const DEFAULT_MAX_RESULTS = 50;
 const DEFAULT_BENEFIT_MAX_RESULTS = 60;
@@ -599,6 +601,55 @@ async function closeMobileContext(context) {
   await context.close().catch(() => {});
 }
 
+async function createDesktopContext(browser, { useLogin = false } = {}) {
+  if (useLogin && USE_LOGIN_PROFILE) {
+    return getLoginPersistentContext();
+  }
+
+  const storageState = useLogin ? getLoginStorageState() : null;
+  const contextOptions = {
+    ...(storageState ? { storageState } : {}),
+    viewport: { width: 1280, height: 900 },
+    screen: { width: 1280, height: 900 },
+    locale: 'ko-KR',
+    timezoneId: 'Asia/Seoul',
+    ignoreHTTPSErrors: true,
+    extraHTTPHeaders: {
+      'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    },
+  };
+
+  let context;
+  let lastClosedError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const targetBrowser = attempt === 0 && browser?.isConnected?.() ? browser : await getBrowser();
+    try {
+      context = await targetBrowser.newContext(contextOptions);
+      break;
+    } catch (error) {
+      if (!isClosedTargetError(error)) throw error;
+      lastClosedError = error;
+      browserPromise = undefined;
+    }
+  }
+
+  if (!context) {
+    throw new Error(
+      `자동 Chrome이 닫혀 조회를 시작하지 못했습니다. 터미널에서 npm start를 Ctrl+C로 끄고 다시 실행해 주세요. (${lastClosedError?.message || 'browser closed'})`,
+    );
+  }
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+  return context;
+}
+
+async function closeDesktopContext(context) {
+  if (USE_LOGIN_PROFILE && context === loginPersistentContext) return;
+  await context.close().catch(() => {});
+}
+
 function extractSku(value) {
   const text = String(value || '');
   const skuLabelMatch = text.match(/(?:sku|스큐|상품sku|상품\s*sku)\D{0,12}(\d{12})/i);
@@ -622,6 +673,50 @@ function normalizeSkuCandidate(value) {
   return isRealSku(digits) ? digits : '';
 }
 
+function cleanText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function uniqueNonEmpty(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const normalized = cleanText(value);
+    if (!normalized || seen.has(normalized.toLowerCase())) continue;
+    seen.add(normalized.toLowerCase());
+    result.push(normalized);
+  }
+  return result;
+}
+
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || '').trim());
+}
+
+function comparisonSearchQueries(keyword) {
+  const input = normalizeSearchInput(keyword);
+  return uniqueNonEmpty([input.originalQuery, input.query, ...(input.aliasVariants || [])]);
+}
+
+function siteErrorRow(site, query, error, productUrl = '') {
+  return {
+    site,
+    sourceQuery: query,
+    brandCode: '',
+    brand: '',
+    productName: error?.message || String(error || '조회 실패'),
+    productSku: extractSku(query),
+    productCode: '',
+    salePrice: '',
+    maxBenefitPrice: '',
+    benefitBreakdown: {},
+    benefitBasis: '확인 실패',
+    benefitDetailsText: error?.message || String(error || '조회 실패'),
+    benefitText: '',
+    productUrl,
+  };
+}
+
 async function gotoAndContinue(page, url, { timeout = 25000 } = {}) {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
@@ -641,9 +736,7 @@ async function gotoAndContinue(page, url, { timeout = 25000 } = {}) {
 
 function publicItem(item) {
   const {
-    productCode: _productCode,
     guestPrice: _guestPrice,
-    salePrice: _salePrice,
     shillaDiscountRate: _shillaDiscountRate,
     shillaRewardRate: _shillaRewardRate,
     shillaSPoint: _shillaSPoint,
@@ -1745,11 +1838,684 @@ async function scrapeBenefitRows(keyword, maxResults = DEFAULT_BENEFIT_MAX_RESUL
   }
 }
 
+function buildLotteSearchUrl(keyword) {
+  const url = new URL('/kr/search', LOTTE_ORIGIN);
+  url.searchParams.set('comSearchWord', keyword);
+  return url.toString();
+}
+
+function buildLotteProductUrl(prdNo, prdOptNo = '') {
+  const url = new URL('/kr/product/productDetail', LOTTE_ORIGIN);
+  url.searchParams.set('prdNo', prdNo);
+  if (prdOptNo) url.searchParams.set('prdOptNo', prdOptNo);
+  return url.toString();
+}
+
+function buildSsgSearchUrl(keyword) {
+  const url = new URL('/kr/search/resultsTotal', SSG_ORIGIN);
+  url.searchParams.set('query', keyword);
+  url.searchParams.set('startCount', '0');
+  url.searchParams.set('offShop', '');
+  url.searchParams.set('suggestReSearchReq', 'true');
+  url.searchParams.set('orReSearchReq', 'true');
+  return url.toString();
+}
+
+function buildSsgProductUrl(goosCd, brand = '0', largeCategory = '0', middleCategory = '0') {
+  const safeParts = [brand || '0', largeCategory || '0', middleCategory || '0', goosCd].map((part) =>
+    encodeURIComponent(String(part || '0')),
+  );
+  return `${SSG_ORIGIN}/kr/goos/view/${safeParts.join('/')}`;
+}
+
+function isLotteProductUrl(value) {
+  try {
+    const url = new URL(value);
+    return /(^|\.)lottedfs\.com$/i.test(url.hostname) && url.pathname.includes('/product/productDetail');
+  } catch {
+    return false;
+  }
+}
+
+function isSsgProductUrl(value) {
+  try {
+    const url = new URL(value);
+    return /(^|\.)ssgdfs\.com$/i.test(url.hostname) && url.pathname.includes('/goos/view/');
+  } catch {
+    return false;
+  }
+}
+
+async function settleGenericSearchPage(page, selectors, maxResults) {
+  await page.waitForSelector(`${selectors}, body`, { timeout: 18000 }).catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+  let previousCount = -1;
+  let stableRounds = 0;
+  for (let i = 0; i < 8; i += 1) {
+    const count = await page.locator(selectors).count().catch(() => 0);
+    if (count >= maxResults) break;
+    if (count === previousCount) stableRounds += 1;
+    else stableRounds = 0;
+    if (stableRounds >= 2) break;
+    previousCount = count;
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+}
+
+function normalizeShillaCompareItem(item, sourceQuery) {
+  const sku = normalizeSkuCandidate(item.productSku) || extractSku(item.productName);
+  return {
+    ...item,
+    site: '신라',
+    sourceQuery,
+    brandCode: item.brandCode || brandCodeFromSku(sku),
+    productSku: sku,
+    salePrice: item.salePrice || '',
+    maxBenefitPrice: item.maxBenefitPrice || item.guestPrice || item.salePrice || '',
+    benefitBreakdown: item.discountRate || item.productDiscount ? { '상품 할인': item.discountRate || item.productDiscount } : {},
+    benefitBasis: '신라 검색 목록',
+    benefitDetailsText: '',
+  };
+}
+
+async function scrapeShillaCompare(keyword, maxResults) {
+  try {
+    const result = await scrapeShilla(keyword, maxResults);
+    return {
+      ...result,
+      items: (result.items || []).map((item) => normalizeShillaCompareItem(item, keyword)),
+    };
+  } catch (error) {
+    return {
+      query: keyword,
+      searchUrl: buildSearchUrl(normalizeSearchInput(keyword).query),
+      finalUrl: '',
+      retrievedAt: new Date().toISOString(),
+      count: 1,
+      items: [siteErrorRow('신라', keyword, error)],
+    };
+  }
+}
+
+async function scrapeLotteSearchItems(context, keyword, maxResults) {
+  if (isLotteProductUrl(keyword)) {
+    const url = new URL(keyword);
+    const prdNo = url.searchParams.get('prdNo') || '';
+    const prdOptNo = url.searchParams.get('prdOptNo') || prdNo;
+    const item = {
+      site: '롯데',
+      sourceQuery: keyword,
+      productCode: prdNo,
+      productSku: '',
+      productUrl: keyword,
+      prdNo,
+      prdOptNo,
+    };
+    return {
+      query: keyword,
+      searchUrl: keyword,
+      finalUrl: keyword,
+      retrievedAt: new Date().toISOString(),
+      count: 1,
+      items: [await scrapeLotteProductDetail(context, item, keyword)],
+    };
+  }
+
+  const queries = comparisonSearchQueries(keyword);
+  let lastResult = null;
+  for (const query of queries) {
+    const searchUrl = buildLotteSearchUrl(query);
+    const page = await context.newPage();
+    try {
+      page.setDefaultTimeout(30000);
+      await gotoAndContinue(page, searchUrl, { timeout: 25000 });
+      await settleGenericSearchPage(page, '#unitStyleList li, .goods_list li', maxResults);
+
+      const extracted = await page.evaluate(
+        ({ origin, limit, sourceQuery }) => {
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const textWithout = (value, remove) => clean(String(value || '').replace(remove || '', ''));
+          const items = [];
+          const seen = new Set();
+          const cards = Array.from(document.querySelectorAll('#unitStyleList li, .goods_list li')).filter((card) =>
+            card.querySelector('.unit_link[data-prdno], .unit_link[data-prdNo]'),
+          );
+
+          for (const card of cards) {
+            const link = card.querySelector('.unit_link[data-prdno], .unit_link[data-prdNo]');
+            const onclick = link?.getAttribute('onclick') || '';
+            const params = Array.from(onclick.matchAll(/'([^']*)'/g)).map((match) => match[1]);
+            const prdNo = link?.getAttribute('data-prdNo') || link?.getAttribute('data-prdno') || params[0] || '';
+            const prdOptNo = /^\d{8,}$/.test(params[1] || '') ? params[1] : prdNo;
+            if (!prdNo || seen.has(prdNo)) continue;
+            seen.add(prdNo);
+
+            const price02 = card.querySelector('.unit_price .price02');
+            const discountRate = clean(price02?.querySelector('.sale')?.textContent || '');
+            const salePrice = clean(card.querySelector('.unit_price .price01')?.textContent || '');
+            const maxBenefitPrice = textWithout(price02?.textContent || '', discountRate);
+            const krwPrice = clean(card.querySelector('.unit_price .price03')?.textContent || '');
+
+            items.push({
+              site: '롯데',
+              sourceQuery,
+              brandCode: '',
+              brand: clean(card.querySelector('.unit_info .brand')?.textContent || ''),
+              productName:
+                clean(card.querySelector('.unit_info .name')?.textContent || '') ||
+                clean(card.querySelector('img[alt]')?.getAttribute('alt') || ''),
+              productSku: '',
+              productCode: prdNo,
+              prdNo,
+              prdOptNo,
+              salePrice,
+              maxBenefitPrice: [maxBenefitPrice, krwPrice].filter(Boolean).join(' / '),
+              productDiscount: discountRate,
+              benefitBreakdown: discountRate ? { '상품 할인': discountRate } : {},
+              benefitBasis: '롯데 검색 목록',
+              benefitDetailsText: '',
+              productUrl: `${origin}/kr/product/productDetail?prdNo=${encodeURIComponent(prdNo)}${
+                prdOptNo ? `&prdOptNo=${encodeURIComponent(prdOptNo)}` : ''
+              }`,
+            });
+
+            if (items.length >= limit) break;
+          }
+
+          const noResultMessage = clean(
+            Array.from(document.querySelectorAll('.no_result, .result_none, .search_result_nodate, .nodata'))
+              .map((node) => node.textContent)
+              .find(Boolean) || '',
+          );
+
+          return { items, noResultMessage, finalUrl: window.location.href };
+        },
+        { origin: LOTTE_ORIGIN, limit: maxResults, sourceQuery: keyword },
+      );
+
+      lastResult = {
+        query: keyword,
+        normalizedQuery: query,
+        searchUrl,
+        finalUrl: extracted.finalUrl,
+        retrievedAt: new Date().toISOString(),
+        count: extracted.items.length,
+        items: extracted.items,
+        noResultMessage: extracted.noResultMessage,
+      };
+      if (extracted.items.length) break;
+    } finally {
+      await page.close().catch(() => {});
+    }
+  }
+
+  const result = lastResult || {
+    query: keyword,
+    searchUrl: buildLotteSearchUrl(keyword),
+    finalUrl: '',
+    retrievedAt: new Date().toISOString(),
+    count: 0,
+    items: [],
+  };
+
+  const rows = [];
+  for (const item of result.items.slice(0, maxResults)) {
+    try {
+      rows.push(await scrapeLotteProductDetail(context, item, keyword));
+    } catch (error) {
+      rows.push({
+        ...item,
+        benefitBasis: '롯데 상세 확인 실패',
+        benefitDetailsText: error.message || '상세 확인 실패',
+      });
+    }
+  }
+
+  return { ...result, count: rows.length, items: rows };
+}
+
+async function scrapeLotteProductDetail(context, item, sourceQuery) {
+  const productUrl = item.productUrl || buildLotteProductUrl(item.prdNo || item.productCode, item.prdOptNo || item.productCode);
+  const page = await context.newPage();
+  try {
+    page.setDefaultTimeout(30000);
+    await gotoAndContinue(page, productUrl, { timeout: 25000 });
+    await page.waitForSelector('body', { timeout: 10000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+    const detail = await page.evaluate(
+      ({ fallback }) => {
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const bodyText = document.body?.innerText || '';
+        const lines = bodyText
+          .split(/\n+/)
+          .map(clean)
+          .filter(Boolean);
+        const firstText = (selectors) => {
+          for (const selector of selectors) {
+            const text = clean(document.querySelector(selector)?.textContent);
+            if (text) return text;
+          }
+          return '';
+        };
+        const inputValue = (id) => clean(document.querySelector(`#${id}`)?.value || '');
+        const moneyOrRatePattern = /(?:-?\$ ?[\d,.]+|-?[\d,]+원|-?[\d,]+P|\d+(?:\.\d+)?\s*%)/i;
+        const moneyPattern = /(?:\$ ?[\d,.]+|[\d,]+원)/i;
+        const findWindow = (matcher, size = 8) => {
+          const index = lines.findIndex((line) => matcher.test(line));
+          return index >= 0 ? lines.slice(index, index + size) : [];
+        };
+        const valueIn = (block, pattern = moneyOrRatePattern) => clean(block.join(' ').match(pattern)?.[0] || '');
+        const addBenefit = (map, label, value) => {
+          const key = clean(label);
+          const val = clean(value);
+          if (key && val && !map[key]) map[key] = val;
+        };
+
+        const benefitBreakdown = {};
+        const maxBlock = findWindow(/최대\s*혜택가|오늘의\s*혜택/i, 12);
+        const saleBlock = findWindow(/판매가|정상가|정가/i, 6);
+        const maxBenefitPrice = valueIn(maxBlock, moneyPattern) || fallback.maxBenefitPrice || '';
+        const salePrice = valueIn(saleBlock, moneyPattern) || fallback.salePrice || '';
+
+        const benefitMatchers = [
+          ['기본혜택', /기본\s*혜택/i],
+          ['상품 할인', /상품\s*할인|기본\s*할인|할인율/i],
+          ['수량할인', /수량\s*할인/i],
+          ['쿠폰', /쿠폰/i],
+          ['L.POINT', /L\.?\s*POINT|엘포인트/i],
+          ['카드 무이자', /무이자/i],
+          ['결제혜택', /결제\s*할인|즉시\s*할인|카드\s*할인/i],
+          ['사은품', /사은품/i],
+        ];
+
+        for (let i = 0; i < lines.length; i += 1) {
+          const line = lines[i];
+          for (const [label, matcher] of benefitMatchers) {
+            if (!matcher.test(line)) continue;
+            const block = lines.slice(i, i + 5);
+            const value = valueIn(block) || block.join(' | ');
+            addBenefit(benefitBreakdown, label, value);
+            break;
+          }
+        }
+
+        if (fallback.productDiscount) benefitBreakdown['상품 할인'] = fallback.productDiscount;
+
+        const benefitDetailsText = lines
+          .filter((line) => /(혜택|할인|쿠폰|적립|포인트|POINT|무이자|사은품)/i.test(line))
+          .slice(0, 70)
+          .join(' | ');
+        const membershipLine = lines.find((line) => /(로그아웃|마이롯데|회원등급|GOLD|SILVER|BLACK|VIP)/i.test(line)) || '';
+
+        return {
+          brand:
+            fallback.brand ||
+            firstText(['.brand, .prod_brand, .brandName, .product-brand']) ||
+            '',
+          productName:
+            firstText(['.name, .prod_name, .product_name, h2, h1']) ||
+            fallback.productName ||
+            '',
+          productSku: inputValue('erpPrdNo') || fallback.productSku || '',
+          productCode: inputValue('prdNo') || fallback.productCode || '',
+          brandCode: inputValue('erpBrndcCd') || inputValue('brndNo') || fallback.brandCode || '',
+          salePrice,
+          maxBenefitPrice,
+          productDiscount: fallback.productDiscount || benefitBreakdown['상품 할인'] || '',
+          benefitBreakdown,
+          benefitBasis: membershipLine ? `롯데 로그인(${membershipLine})` : '롯데 상세',
+          benefitDetailsText,
+          finalUrl: window.location.href,
+        };
+      },
+      { fallback: item },
+    );
+
+    return {
+      ...item,
+      ...detail,
+      site: '롯데',
+      sourceQuery,
+      salePrice: detail.salePrice || item.salePrice || '',
+      maxBenefitPrice:
+        detail.maxBenefitPrice && item.maxBenefitPrice && !detail.maxBenefitPrice.includes('/')
+          ? item.maxBenefitPrice
+          : detail.maxBenefitPrice || item.maxBenefitPrice || '',
+      productUrl: /^https?:\/\//i.test(detail.finalUrl || '') ? detail.finalUrl : productUrl,
+    };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+async function scrapeSsgSearchItems(context, keyword, maxResults) {
+  if (isSsgProductUrl(keyword)) {
+    const sku = extractSku(keyword);
+    const item = {
+      site: '신세계',
+      sourceQuery: keyword,
+      productSku: sku,
+      productCode: sku,
+      productUrl: keyword,
+    };
+    return {
+      query: keyword,
+      searchUrl: keyword,
+      finalUrl: keyword,
+      retrievedAt: new Date().toISOString(),
+      count: 1,
+      items: [await scrapeSsgProductDetail(context, item, keyword)],
+    };
+  }
+
+  const inputSku = normalizeSkuCandidate(keyword);
+  if (inputSku) {
+    const item = {
+      site: '신세계',
+      sourceQuery: keyword,
+      productSku: inputSku,
+      productCode: inputSku,
+      productUrl: buildSsgProductUrl(inputSku),
+    };
+    try {
+      return {
+        query: keyword,
+        searchUrl: item.productUrl,
+        finalUrl: item.productUrl,
+        retrievedAt: new Date().toISOString(),
+        count: 1,
+        items: [await scrapeSsgProductDetail(context, item, keyword)],
+      };
+    } catch {
+      // Fall through to keyword search.
+    }
+  }
+
+  const queries = comparisonSearchQueries(keyword);
+  let lastResult = null;
+  for (const query of queries) {
+    const searchUrl = buildSsgSearchUrl(query);
+    const page = await context.newPage();
+    try {
+      page.setDefaultTimeout(30000);
+      await gotoAndContinue(page, searchUrl, { timeout: 25000 });
+      await settleGenericSearchPage(page, '.prodCont, .goodsList li, .prodList li, .goosList li', maxResults);
+
+      const extracted = await page.evaluate(
+        ({ origin, limit, sourceQuery }) => {
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const cards = Array.from(document.querySelectorAll('.prodCont, .goodsList li, .prodList li, .goosList li')).filter((card) =>
+            /goos_cd|data-param4|prodName|brandName/i.test(card.innerHTML || ''),
+          );
+          const items = [];
+          const seen = new Set();
+
+          for (const card of cards) {
+            const html = card.innerHTML || '';
+            const link = card.querySelector('a[onclick*="goDetail"], a[data-param4]');
+            const onclick = link?.getAttribute('onclick') || card.querySelector('[onclick*="goDetail"]')?.getAttribute('onclick') || '';
+            const dataParam3 = link?.getAttribute('data-param3') || card.querySelector('[data-param3]')?.getAttribute('data-param3') || '';
+            const dataParam4 = link?.getAttribute('data-param4') || card.querySelector('[data-param4]')?.getAttribute('data-param4') || '';
+            const goosCd =
+              (onclick.match(/goos_cd\s*:\s*'([^']+)'/) || [])[1] ||
+              (dataParam4.match(/^(\d{12})\^/) || [])[1] ||
+              (html.match(/\b\d{12}\b/) || [])[0] ||
+              '';
+            if (!goosCd || seen.has(goosCd)) continue;
+            seen.add(goosCd);
+
+            const brandParts = dataParam3.split('^');
+            const brandCodeCandidate = clean(brandParts[0] || '');
+            const brandCode = /^\d{3,8}$/.test(brandCodeCandidate) ? brandCodeCandidate : '';
+            const brandNames = (brandParts[1] || '').split('||');
+            const brandKo = clean(brandNames[0] || '');
+            const brandEn =
+              clean(brandNames[1] || '') ||
+              clean((onclick.match(/bran_nm\s*:\s*'([^']+)'/) || [])[1] || '');
+            const productName =
+              clean(card.querySelector('.prodName')?.textContent || '') ||
+              clean((dataParam4.match(/^\d{12}\^(.+)$/) || [])[1] || '') ||
+              clean(card.querySelector('img[alt]')?.getAttribute('alt') || '');
+            const salePrice = clean(card.querySelector('.originPrice')?.textContent || '');
+            const rate = clean(card.querySelector('.saleNum')?.textContent || '').replace(/\s+/g, '');
+            const maxBenefitPrice = clean(card.querySelector('.saleDollar')?.textContent || '');
+            const brand = brandKo || brandEn || clean(card.querySelector('.brandName')?.textContent || '');
+
+            items.push({
+              site: '신세계',
+              sourceQuery,
+              brandCode,
+              brand,
+              brandEnglish: brandEn || brand,
+              productName,
+              productSku: goosCd,
+              productCode: goosCd,
+              salePrice,
+              maxBenefitPrice,
+              productDiscount: rate,
+              benefitBreakdown: rate ? { '상품 할인': rate } : {},
+              benefitBasis: '신세계 검색 목록',
+              benefitDetailsText: '',
+              productUrl: `${origin}/kr/goos/view/${encodeURIComponent(brandEn || brand || '0')}/0/0/${goosCd}`,
+            });
+
+            if (items.length >= limit) break;
+          }
+
+          const noResultMessage = clean(
+            Array.from(document.querySelectorAll('.noData, .nodata, .no_result, .result_none'))
+              .map((node) => node.textContent)
+              .find(Boolean) || '',
+          );
+          return { items, noResultMessage, finalUrl: window.location.href };
+        },
+        { origin: SSG_ORIGIN, limit: maxResults, sourceQuery: keyword },
+      );
+
+      lastResult = {
+        query: keyword,
+        normalizedQuery: query,
+        searchUrl,
+        finalUrl: extracted.finalUrl,
+        retrievedAt: new Date().toISOString(),
+        count: extracted.items.length,
+        items: extracted.items,
+        noResultMessage: extracted.noResultMessage,
+      };
+      if (extracted.items.length) break;
+    } finally {
+      await page.close().catch(() => {});
+    }
+  }
+
+  const result = lastResult || {
+    query: keyword,
+    searchUrl: buildSsgSearchUrl(keyword),
+    finalUrl: '',
+    retrievedAt: new Date().toISOString(),
+    count: 0,
+    items: [],
+  };
+
+  const rows = [];
+  for (const item of result.items.slice(0, maxResults)) {
+    try {
+      rows.push(await scrapeSsgProductDetail(context, item, keyword));
+    } catch (error) {
+      rows.push({
+        ...item,
+        benefitBasis: '신세계 상세 확인 실패',
+        benefitDetailsText: error.message || '상세 확인 실패',
+      });
+    }
+  }
+
+  return { ...result, count: rows.length, items: rows };
+}
+
+async function scrapeSsgProductDetail(context, item, sourceQuery) {
+  const productUrl = item.productUrl || buildSsgProductUrl(item.productSku || item.productCode, item.brandEnglish || item.brand || '0');
+  const page = await context.newPage();
+  try {
+    page.setDefaultTimeout(30000);
+    await gotoAndContinue(page, productUrl, { timeout: 25000 });
+    await page.waitForSelector('body', { timeout: 10000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+    const previewButton = page.getByRole('button', { name: /혜택\s*미리보기|혜택\s*보기|최대\s*혜택/i }).first();
+    if ((await previewButton.count().catch(() => 0)) > 0) {
+      await previewButton.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(800);
+    }
+
+    const detail = await page.evaluate(
+      ({ fallback }) => {
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const bodyText = document.body?.innerText || '';
+        const lines = bodyText
+          .split(/\n+/)
+          .map(clean)
+          .filter(Boolean);
+        const firstText = (selectors) => {
+          for (const selector of selectors) {
+            const text = clean(document.querySelector(selector)?.textContent);
+            if (text) return text;
+          }
+          return '';
+        };
+        const valueNear = (matcher, pattern, size = 8) => {
+          const index = lines.findIndex((line) => matcher.test(line));
+          if (index < 0) return '';
+          return clean(lines.slice(index, index + size).join(' ').match(pattern)?.[0] || '');
+        };
+        const moneyPattern = /\$ ?[\d,.]+|[\d,]+원/i;
+        const moneyOrRatePattern = /(?:-?\$ ?[\d,.]+|-?[\d,]+원|-?[\d,]+P|\d+(?:\.\d+)?\s*%|[\d,]+\s*만원)/i;
+        const addBenefit = (map, label, value) => {
+          const key = clean(label);
+          const val = clean(value);
+          if (key && val && !map[key]) map[key] = val;
+        };
+
+        const sku = (window.location.pathname.match(/\/(\d{12})(?:[/?#]|$)/) || [])[1] || fallback.productSku || '';
+        const benefitBreakdown = {};
+        const labelMatchers = [
+          ['상품 할인', /상품\s*할인|할인가|할인율/i],
+          ['쿠폰', /쿠폰/i],
+          ['적립금', /적립금/i],
+          ['결제할인포인트', /결제\s*할인\s*포인트|결제할인포인트/i],
+          ['면세포인트', /면세\s*포인트|면세포인트/i],
+          ['S포인트', /S\s*포인트|S-?POINT|S POINT|S포인트/i],
+          ['토스페이 현대카드', /토스페이\s*현대카드/i],
+          ['Apple Pay', /Apple\s*Pay/i],
+          ['카카오페이', /카카오페이/i],
+          ['롯데카드', /롯데카드/i],
+          ['카드 혜택', /카드|즉시\s*할인|결제일\s*할인/i],
+        ];
+
+        for (let i = 0; i < lines.length; i += 1) {
+          const line = lines[i];
+          for (const [label, matcher] of labelMatchers) {
+            if (!matcher.test(line)) continue;
+            const block = lines.slice(i, i + 4);
+            const value = clean(block.join(' ').match(moneyOrRatePattern)?.[0] || block.join(' | '));
+            addBenefit(benefitBreakdown, label, value);
+            break;
+          }
+        }
+
+        if (fallback.productDiscount) benefitBreakdown['상품 할인'] = fallback.productDiscount;
+
+        const benefitDetailsText = lines
+          .filter((line) => /(혜택|할인|쿠폰|적립|포인트|Pay|카드|최대혜택가|보유한)/i.test(line))
+          .slice(0, 90)
+          .join(' | ');
+        const membershipLine = lines.find((line) => /(로그아웃|마이페이지|회원등급|BLACK|GOLD|SILVER|VIP)/i.test(line)) || '';
+
+        return {
+          brand:
+            fallback.brand ||
+            firstText(['.brandName, .brand, .brand_name, .prodBrand']) ||
+            '',
+          productName:
+            firstText(['.prodName, .goosNm, .productName, .product_name, h1, h2']) ||
+            fallback.productName ||
+            '',
+          productSku: sku,
+          productCode: sku || fallback.productCode || '',
+          brandCode: fallback.brandCode || '',
+          salePrice: valueNear(/판매가|정가|정상가/i, moneyPattern, 8) || fallback.salePrice || '',
+          maxBenefitPrice:
+            valueNear(/최대\s*혜택가|예상\s*결제|할인가|총\s*혜택가/i, moneyPattern, 10) ||
+            fallback.maxBenefitPrice ||
+            '',
+          productDiscount: fallback.productDiscount || benefitBreakdown['상품 할인'] || '',
+          benefitBreakdown,
+          benefitBasis: membershipLine ? `신세계 로그인(${membershipLine})` : '신세계 상세',
+          benefitDetailsText,
+          finalUrl: window.location.href,
+        };
+      },
+      { fallback: item },
+    );
+
+    return {
+      ...item,
+      ...detail,
+      site: '신세계',
+      sourceQuery,
+      productUrl: /^https?:\/\//i.test(detail.finalUrl || '') ? detail.finalUrl : productUrl,
+    };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+async function scrapeDutyFreeCompare(keyword, maxResults = DEFAULT_BENEFIT_MAX_RESULTS) {
+  const desktopBrowser = USE_LOGIN_PROFILE ? null : await getBrowser();
+  const desktopContext = await createDesktopContext(desktopBrowser, { useLogin: USE_LOGIN_PROFILE || hasLoginStorageState() });
+  const results = [];
+
+  try {
+    const shillaResult = await scrapeShillaCompare(keyword, maxResults);
+    results.push(...(shillaResult.items || []));
+
+    try {
+      const lotteResult = await scrapeLotteSearchItems(desktopContext, keyword, maxResults);
+      results.push(...(lotteResult.items || []));
+    } catch (error) {
+      results.push(siteErrorRow('롯데', keyword, error));
+    }
+
+    try {
+      const ssgResult = await scrapeSsgSearchItems(desktopContext, keyword, maxResults);
+      results.push(...(ssgResult.items || []));
+    } catch (error) {
+      results.push(siteErrorRow('신세계', keyword, error));
+    }
+
+    return {
+      query: keyword,
+      loginApplied: USE_LOGIN_PROFILE || hasLoginStorageState(),
+      accountLabel: USE_LOGIN_PROFILE ? '로컬 Chrome 프로필' : hasLoginStorageState() ? '저장된 세션' : '',
+      searchUrl: shillaResult.searchUrl || '',
+      finalUrl: '',
+      retrievedAt: new Date().toISOString(),
+      count: results.length,
+      items: results,
+    };
+  } finally {
+    await closeDesktopContext(desktopContext);
+  }
+}
+
 const STATIC_ASSETS = new Map([
-  ["/", { type: "text/html; charset=utf-8", body: "<!doctype html>\n<html lang=\"ko\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <title>신라면세점 모바일 상품/혜택 조회</title>\n    <link rel=\"stylesheet\" href=\"/styles.css\" />\n  </head>\n  <body>\n    <main class=\"app\">\n      <section class=\"search-panel\">\n        <div>\n          <h1>신라면세점 모바일 상품/혜택 조회</h1>\n          <p class=\"subtle\">상품명, SKU, 신라 상품 URL을 입력하면 모바일 검색 결과에서 상품 정보를 추출합니다.</p>\n        </div>\n\n        <form id=\"searchForm\" class=\"search-form\">\n          <input\n            id=\"query\"\n            name=\"query\"\n            type=\"search\"\n            autocomplete=\"off\"\n            placeholder=\"예: 라네즈, 5745177, https://m.shilladfs.com/.../p/5786502\"\n            aria-label=\"상품명, SKU, 신라 상품 URL\"\n            required\n          />\n          <button id=\"searchButton\" type=\"submit\">검색</button>\n        </form>\n      </section>\n\n      <section class=\"upload-panel\">\n        <div>\n          <h2>엑셀 일괄 조회</h2>\n          <p class=\"subtle\">파일의 입력값 열에 브랜드명, SKU, 상품 URL을 한 줄에 하나씩 넣으면 됩니다.</p>\n        </div>\n        <div class=\"upload-controls\">\n          <input id=\"batchFile\" type=\"file\" accept=\".xlsx,.xls,.csv,.tsv,.txt\" />\n          <button id=\"templateButton\" class=\"secondary-button\" type=\"button\">엑셀 양식 다운로드</button>\n          <button id=\"benefitsButton\" type=\"button\">파일 일괄 조회</button>\n        </div>\n        <div id=\"batchFileInfo\" class=\"file-info\" aria-live=\"polite\">선택된 파일이 없습니다.</div>\n      </section>\n\n      <section class=\"status-panel\" aria-live=\"polite\">\n        <div id=\"statusText\">검색어를 입력하세요.</div>\n        <div class=\"status-actions\">\n          <button id=\"downloadButton\" class=\"secondary-button\" type=\"button\" hidden>엑셀 다운로드</button>\n          <a id=\"sourceLink\" class=\"source-link\" href=\"#\" target=\"_blank\" rel=\"noreferrer\" hidden>검색 결과 페이지 열기</a>\n        </div>\n      </section>\n\n      <section class=\"table-wrap\">\n        <table>\n          <thead id=\"resultsHead\">\n            <tr>\n              <th>입력값</th>\n              <th>브랜드코드</th>\n              <th>브랜드</th>\n              <th>상품명</th>\n              <th>상품SKU</th>\n              <th>최대혜택가</th>\n              <th>조회기준</th>\n              <th>상품 URL</th>\n            </tr>\n          </thead>\n          <tbody id=\"resultsBody\">\n            <tr class=\"empty-row\">\n              <td colspan=\"8\">아직 조회한 결과가 없습니다.</td>\n            </tr>\n          </tbody>\n        </table>\n      </section>\n    </main>\n\n    <script src=\"https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js\"></script>\n    <script src=\"/app.js\" type=\"module\"></script>\n  </body>\n</html>\n" }],
-  ["/index.html", { type: "text/html; charset=utf-8", body: "<!doctype html>\n<html lang=\"ko\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <title>신라면세점 모바일 상품/혜택 조회</title>\n    <link rel=\"stylesheet\" href=\"/styles.css\" />\n  </head>\n  <body>\n    <main class=\"app\">\n      <section class=\"search-panel\">\n        <div>\n          <h1>신라면세점 모바일 상품/혜택 조회</h1>\n          <p class=\"subtle\">상품명, SKU, 신라 상품 URL을 입력하면 모바일 검색 결과에서 상품 정보를 추출합니다.</p>\n        </div>\n\n        <form id=\"searchForm\" class=\"search-form\">\n          <input\n            id=\"query\"\n            name=\"query\"\n            type=\"search\"\n            autocomplete=\"off\"\n            placeholder=\"예: 라네즈, 5745177, https://m.shilladfs.com/.../p/5786502\"\n            aria-label=\"상품명, SKU, 신라 상품 URL\"\n            required\n          />\n          <button id=\"searchButton\" type=\"submit\">검색</button>\n        </form>\n      </section>\n\n      <section class=\"upload-panel\">\n        <div>\n          <h2>엑셀 일괄 조회</h2>\n          <p class=\"subtle\">파일의 입력값 열에 브랜드명, SKU, 상품 URL을 한 줄에 하나씩 넣으면 됩니다.</p>\n        </div>\n        <div class=\"upload-controls\">\n          <input id=\"batchFile\" type=\"file\" accept=\".xlsx,.xls,.csv,.tsv,.txt\" />\n          <button id=\"templateButton\" class=\"secondary-button\" type=\"button\">엑셀 양식 다운로드</button>\n          <button id=\"benefitsButton\" type=\"button\">파일 일괄 조회</button>\n        </div>\n        <div id=\"batchFileInfo\" class=\"file-info\" aria-live=\"polite\">선택된 파일이 없습니다.</div>\n      </section>\n\n      <section class=\"status-panel\" aria-live=\"polite\">\n        <div id=\"statusText\">검색어를 입력하세요.</div>\n        <div class=\"status-actions\">\n          <button id=\"downloadButton\" class=\"secondary-button\" type=\"button\" hidden>엑셀 다운로드</button>\n          <a id=\"sourceLink\" class=\"source-link\" href=\"#\" target=\"_blank\" rel=\"noreferrer\" hidden>검색 결과 페이지 열기</a>\n        </div>\n      </section>\n\n      <section class=\"table-wrap\">\n        <table>\n          <thead id=\"resultsHead\">\n            <tr>\n              <th>입력값</th>\n              <th>브랜드코드</th>\n              <th>브랜드</th>\n              <th>상품명</th>\n              <th>상품SKU</th>\n              <th>최대혜택가</th>\n              <th>조회기준</th>\n              <th>상품 URL</th>\n            </tr>\n          </thead>\n          <tbody id=\"resultsBody\">\n            <tr class=\"empty-row\">\n              <td colspan=\"8\">아직 조회한 결과가 없습니다.</td>\n            </tr>\n          </tbody>\n        </table>\n      </section>\n    </main>\n\n    <script src=\"https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js\"></script>\n    <script src=\"/app.js\" type=\"module\"></script>\n  </body>\n</html>\n" }],
+  ["/", { type: "text/html; charset=utf-8", body: "<!doctype html>\n<html lang=\"ko\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <title>면세점 3사 상품/혜택 조회</title>\n    <link rel=\"stylesheet\" href=\"/styles.css\" />\n  </head>\n  <body>\n    <main class=\"app\">\n      <section class=\"search-panel\">\n        <div>\n          <h1>면세점 3사 상품/혜택 조회</h1>\n          <p class=\"subtle\">브랜드명, SKU, 상품 URL을 입력하면 신라·롯데·신세계 결과를 한 번에 비교합니다.</p>\n        </div>\n\n        <form id=\"searchForm\" class=\"search-form\">\n          <input\n            id=\"query\"\n            name=\"query\"\n            type=\"search\"\n            autocomplete=\"off\"\n            placeholder=\"예: 오쏘몰, 102467200030, https://m.shilladfs.com/.../p/5786502\"\n            aria-label=\"상품명, SKU, 상품 URL\"\n            required\n          />\n          <button id=\"searchButton\" type=\"submit\">검색</button>\n        </form>\n      </section>\n\n      <section class=\"upload-panel\">\n        <div>\n          <h2>엑셀 일괄 조회</h2>\n          <p class=\"subtle\">파일의 입력값 열에 브랜드명, SKU, 상품 URL을 한 줄에 하나씩 넣으면 됩니다.</p>\n        </div>\n        <div class=\"upload-controls\">\n          <input id=\"batchFile\" type=\"file\" accept=\".xlsx,.xls,.csv,.tsv,.txt\" />\n          <button id=\"templateButton\" class=\"secondary-button\" type=\"button\">엑셀 양식 다운로드</button>\n          <button id=\"benefitsButton\" type=\"button\">파일 일괄 조회</button>\n        </div>\n        <div id=\"batchFileInfo\" class=\"file-info\" aria-live=\"polite\">선택된 파일이 없습니다.</div>\n      </section>\n\n      <section class=\"status-panel\" aria-live=\"polite\">\n        <div id=\"statusText\">검색어를 입력하세요.</div>\n        <div class=\"status-actions\">\n          <button id=\"downloadButton\" class=\"secondary-button\" type=\"button\" hidden>엑셀 다운로드</button>\n          <a id=\"sourceLink\" class=\"source-link\" href=\"#\" target=\"_blank\" rel=\"noreferrer\" hidden>검색 결과 페이지 열기</a>\n        </div>\n      </section>\n\n      <section class=\"table-wrap\">\n        <table>\n          <thead id=\"resultsHead\">\n            <tr>\n              <th>사이트</th>\n              <th>입력값</th>\n              <th>브랜드코드</th>\n              <th>브랜드</th>\n              <th>상품명</th>\n              <th>상품SKU</th>\n              <th>상품코드</th>\n              <th>판매가</th>\n              <th>할인가/최대혜택가</th>\n              <th>조회기준</th>\n              <th>상품 URL</th>\n            </tr>\n          </thead>\n          <tbody id=\"resultsBody\">\n            <tr class=\"empty-row\">\n              <td colspan=\"11\">아직 조회한 결과가 없습니다.</td>\n            </tr>\n          </tbody>\n        </table>\n      </section>\n    </main>\n\n    <script src=\"https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js\"></script>\n    <script src=\"/app.js\" type=\"module\"></script>\n  </body>\n</html>\n" }],
+  ["/index.html", { type: "text/html; charset=utf-8", body: "<!doctype html>\n<html lang=\"ko\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <title>면세점 3사 상품/혜택 조회</title>\n    <link rel=\"stylesheet\" href=\"/styles.css\" />\n  </head>\n  <body>\n    <main class=\"app\">\n      <section class=\"search-panel\">\n        <div>\n          <h1>면세점 3사 상품/혜택 조회</h1>\n          <p class=\"subtle\">브랜드명, SKU, 상품 URL을 입력하면 신라·롯데·신세계 결과를 한 번에 비교합니다.</p>\n        </div>\n\n        <form id=\"searchForm\" class=\"search-form\">\n          <input\n            id=\"query\"\n            name=\"query\"\n            type=\"search\"\n            autocomplete=\"off\"\n            placeholder=\"예: 오쏘몰, 102467200030, https://m.shilladfs.com/.../p/5786502\"\n            aria-label=\"상품명, SKU, 상품 URL\"\n            required\n          />\n          <button id=\"searchButton\" type=\"submit\">검색</button>\n        </form>\n      </section>\n\n      <section class=\"upload-panel\">\n        <div>\n          <h2>엑셀 일괄 조회</h2>\n          <p class=\"subtle\">파일의 입력값 열에 브랜드명, SKU, 상품 URL을 한 줄에 하나씩 넣으면 됩니다.</p>\n        </div>\n        <div class=\"upload-controls\">\n          <input id=\"batchFile\" type=\"file\" accept=\".xlsx,.xls,.csv,.tsv,.txt\" />\n          <button id=\"templateButton\" class=\"secondary-button\" type=\"button\">엑셀 양식 다운로드</button>\n          <button id=\"benefitsButton\" type=\"button\">파일 일괄 조회</button>\n        </div>\n        <div id=\"batchFileInfo\" class=\"file-info\" aria-live=\"polite\">선택된 파일이 없습니다.</div>\n      </section>\n\n      <section class=\"status-panel\" aria-live=\"polite\">\n        <div id=\"statusText\">검색어를 입력하세요.</div>\n        <div class=\"status-actions\">\n          <button id=\"downloadButton\" class=\"secondary-button\" type=\"button\" hidden>엑셀 다운로드</button>\n          <a id=\"sourceLink\" class=\"source-link\" href=\"#\" target=\"_blank\" rel=\"noreferrer\" hidden>검색 결과 페이지 열기</a>\n        </div>\n      </section>\n\n      <section class=\"table-wrap\">\n        <table>\n          <thead id=\"resultsHead\">\n            <tr>\n              <th>사이트</th>\n              <th>입력값</th>\n              <th>브랜드코드</th>\n              <th>브랜드</th>\n              <th>상품명</th>\n              <th>상품SKU</th>\n              <th>상품코드</th>\n              <th>판매가</th>\n              <th>할인가/최대혜택가</th>\n              <th>조회기준</th>\n              <th>상품 URL</th>\n            </tr>\n          </thead>\n          <tbody id=\"resultsBody\">\n            <tr class=\"empty-row\">\n              <td colspan=\"11\">아직 조회한 결과가 없습니다.</td>\n            </tr>\n          </tbody>\n        </table>\n      </section>\n    </main>\n\n    <script src=\"https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js\"></script>\n    <script src=\"/app.js\" type=\"module\"></script>\n  </body>\n</html>\n" }],
   ["/styles.css", { type: "text/css; charset=utf-8", body: ":root {\n  color-scheme: light;\n  --bg: #f6f7f9;\n  --panel: #ffffff;\n  --text: #1c1d1f;\n  --muted: #6b7280;\n  --line: #d9dde3;\n  --accent: #111827;\n  --accent-hover: #303846;\n  --error: #b42318;\n}\n\n* {\n  box-sizing: border-box;\n}\n\nbody {\n  margin: 0;\n  background: var(--bg);\n  color: var(--text);\n  font-family:\n    system-ui,\n    -apple-system,\n    BlinkMacSystemFont,\n    \"Segoe UI\",\n    sans-serif;\n}\n\n.app {\n  width: min(1180px, calc(100% - 32px));\n  margin: 32px auto;\n}\n\n.search-panel,\n.upload-panel,\n.status-panel,\n.table-wrap {\n  background: var(--panel);\n  border: 1px solid var(--line);\n  border-radius: 8px;\n}\n\n.search-panel {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) minmax(320px, 520px);\n  gap: 24px;\n  align-items: end;\n  padding: 24px;\n}\n\n.upload-panel {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) minmax(320px, 520px);\n  gap: 24px;\n  align-items: end;\n  margin-top: 16px;\n  padding: 20px 24px;\n}\n\nh1 {\n  margin: 0 0 8px;\n  font-size: 24px;\n  line-height: 1.25;\n}\n\nh2 {\n  margin: 0 0 8px;\n  font-size: 18px;\n  line-height: 1.3;\n}\n\n.subtle {\n  margin: 0;\n  color: var(--muted);\n  line-height: 1.5;\n}\n\n.search-form {\n  display: flex;\n  gap: 10px;\n}\n\n.upload-controls {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) repeat(2, auto);\n  gap: 10px;\n}\n\n.file-info {\n  grid-column: 1 / -1;\n  padding: 10px 12px;\n  border: 1px solid var(--line);\n  border-radius: 6px;\n  background: #f9fafb;\n  color: var(--muted);\n  font-size: 14px;\n  line-height: 1.45;\n  word-break: break-all;\n}\n\ninput,\nbutton {\n  height: 44px;\n  border-radius: 6px;\n  font: inherit;\n}\n\ninput {\n  width: 100%;\n  border: 1px solid var(--line);\n  padding: 0 12px;\n  background: #fff;\n}\n\ninput[type='file'] {\n  padding: 10px 12px;\n}\n\ninput:focus {\n  outline: 2px solid #9ca3af;\n  outline-offset: 1px;\n}\n\nbutton {\n  min-width: 96px;\n  border: 0;\n  background: var(--accent);\n  color: #fff;\n  cursor: pointer;\n  font-weight: 700;\n}\n\nbutton:hover:not(:disabled) {\n  background: var(--accent-hover);\n}\n\nbutton:disabled {\n  cursor: wait;\n  opacity: 0.65;\n}\n\n.status-panel {\n  display: flex;\n  justify-content: space-between;\n  gap: 16px;\n  align-items: center;\n  margin: 16px 0;\n  padding: 14px 16px;\n  color: var(--muted);\n}\n\n.status-panel.error {\n  color: var(--error);\n}\n\n.source-link {\n  color: var(--accent);\n  font-weight: 700;\n  white-space: nowrap;\n}\n\n.status-actions {\n  display: flex;\n  gap: 10px;\n  align-items: center;\n}\n\n.secondary-button {\n  min-width: auto;\n  height: 34px;\n  padding: 0 12px;\n  border: 1px solid var(--line);\n  background: #fff;\n  color: var(--accent);\n}\n\n.secondary-button:hover:not(:disabled) {\n  background: #f3f4f6;\n}\n\n.upload-controls .secondary-button {\n  height: 44px;\n}\n\n.table-wrap {\n  overflow-x: auto;\n}\n\ntable {\n  width: 100%;\n  border-collapse: collapse;\n  min-width: 2180px;\n}\n\nth,\ntd {\n  padding: 14px 12px;\n  border-bottom: 1px solid var(--line);\n  text-align: left;\n  vertical-align: top;\n  line-height: 1.45;\n}\n\nth {\n  position: sticky;\n  top: 0;\n  background: #f9fafb;\n  color: #374151;\n  font-size: 13px;\n  white-space: nowrap;\n}\n\ntd {\n  font-size: 14px;\n}\n\n.product-name {\n  min-width: 260px;\n  font-weight: 700;\n}\n\n.source-query {\n  min-width: 180px;\n  max-width: 260px;\n  word-break: break-all;\n}\n\n.price {\n  white-space: nowrap;\n}\n\n.url-cell {\n  max-width: 320px;\n  word-break: break-all;\n}\n\n.detail-cell {\n  min-width: 360px;\n  max-width: 520px;\n  white-space: normal;\n  word-break: keep-all;\n}\n\n.url-cell a {\n  color: #1f4f99;\n}\n\n.empty-row td {\n  padding: 36px 12px;\n  color: var(--muted);\n  text-align: center;\n}\n\n@media (max-width: 760px) {\n  .app {\n    width: min(100% - 20px, 1180px);\n    margin: 16px auto;\n  }\n\n  .search-panel {\n    grid-template-columns: 1fr;\n    padding: 18px;\n  }\n\n  .upload-panel,\n  .upload-controls {\n    grid-template-columns: 1fr;\n  }\n\n  .search-form,\n  .status-panel {\n    flex-direction: column;\n    align-items: stretch;\n  }\n\n  button {\n    width: 100%;\n  }\n}\n" }],
-  ["/app.js", { type: "text/javascript; charset=utf-8", body: "const form = document.querySelector('#searchForm');\nconst queryInput = document.querySelector('#query');\nconst button = document.querySelector('#searchButton');\nconst statusPanel = document.querySelector('.status-panel');\nconst statusText = document.querySelector('#statusText');\nconst sourceLink = document.querySelector('#sourceLink');\nconst resultsHead = document.querySelector('#resultsHead');\nconst resultsBody = document.querySelector('#resultsBody');\nconst batchFileInput = document.querySelector('#batchFile');\nconst batchFileInfo = document.querySelector('#batchFileInfo');\nconst benefitsButton = document.querySelector('#benefitsButton');\nconst templateButton = document.querySelector('#templateButton');\nconst downloadButton = document.querySelector('#downloadButton');\n\nconst BATCH_MAX_RESULTS_PER_QUERY = 60;\nconst SINGLE_BENEFIT_MAX_RESULTS = 60;\nconst BATCH_BENEFIT_MAX_RESULTS_PER_QUERY = 60;\nconst BATCH_MAX_QUERIES = 200;\nconst DETAIL_LOOKUP_CONCURRENCY = 1;\nconst SEARCH_RESULT_BASIS = '비로그인 검색';\nconst BASE_RESULT_HEADERS = ['입력값', '브랜드코드', '브랜드', '상품명', '상품SKU', '최대혜택가'];\nconst TRAILING_RESULT_HEADERS = ['조회기준', '상품 URL'];\nconst TEMPLATE_ROWS = [\n  ['입력값'],\n  ['라네즈'],\n  ['102467200030'],\n  ['https://m.shilladfs.com/estore/kr/ko/p/5786502?isSavedId=true'],\n];\nlet latestRows = [];\nlet loginSession = { loginAvailable: false, loginValid: false, accountLabel: '비회원' };\nlet loginPromptShown = false;\n\nconst LOGIN_SETUP_MESSAGE = [\n  '로그인은 앱한테 신라면세점 문을 열 수 있는 열쇠를 주는 일입니다.',\n  '',\n  '이 노트북에서 다시 로그인하는 방법:',\n  '1. 터미널을 엽니다.',\n  '2. cd ~/Documents/GitHub/-shilla-mobile-guest-search 를 붙여넣고 Enter를 누릅니다.',\n  '3. npm run capture:login 을 붙여넣고 Enter를 누릅니다.',\n  '4. Chrome 창이 열리면 신라면세점에 로그인합니다.',\n  '5. 상품 상세페이지가 보이면 터미널로 돌아와 Enter를 누릅니다.',\n  '6. 같은 노트북에서 npm start로 앱을 다시 켜고 http://localhost:3000 으로 들어갑니다.',\n  '',\n  '회사 컴퓨터에서 쓰려면 회사 컴퓨터에서도 위 과정을 한 번 해야 합니다.',\n].join('\\n');\n\nconst RENDER_SECURITY_MESSAGE = [\n  'Render는 내 노트북이 아니라 밖에 있는 다른 컴퓨터입니다.',\n  '신라면세점이 그 컴퓨터는 문 앞에서 막고 있습니다.',\n  '그래서 Render 주소에서는 로그인 혜택 조회가 안 됩니다.',\n  '',\n  '로그인 혜택은 지금 쓰는 노트북에서 npm start로 켠 http://localhost:3000 에서 조회합니다.',\n  '회사 컴퓨터에서 쓰려면 회사 컴퓨터에서 다시 로그인 캡처를 해야 합니다.',\n].join('\\n');\n\nfunction setStatus(message, { error = false, sourceUrl = '' } = {}) {\n  statusPanel.classList.toggle('error', error);\n  statusText.textContent = message;\n\n  if (sourceUrl) {\n    sourceLink.href = sourceUrl;\n    sourceLink.hidden = false;\n  } else {\n    sourceLink.hidden = true;\n  }\n}\n\nfunction escapeHtml(value) {\n  return String(value || '')\n    .replaceAll('&', '&amp;')\n    .replaceAll('<', '&lt;')\n    .replaceAll('>', '&gt;')\n    .replaceAll('\"', '&quot;')\n    .replaceAll(\"'\", '&#039;');\n}\n\nfunction renderEmpty(message) {\n  latestRows = [];\n  downloadButton.hidden = true;\n  const headers = renderHeaders([]);\n  resultsBody.innerHTML = `\n    <tr class=\"empty-row\">\n      <td colspan=\"${headers.length}\">${escapeHtml(message)}</td>\n    </tr>\n  `;\n}\n\nfunction benefitHeadersForRows(items) {\n  const preferredOrder = [\n    '상품 할인',\n    '데일리 쿠폰',\n    '브랜드 쿠폰',\n    '상품 쿠폰',\n    '장바구니 쿠폰',\n    '카드 할인',\n    '쿠폰 다운로드',\n    '적립금',\n    'S포인트',\n  ];\n  const headers = new Set();\n\n  for (const item of items) {\n    for (const header of Object.keys(item.benefitBreakdown || {})) {\n      if (header) headers.add(header);\n    }\n    if (item.productDiscount) headers.add('상품 할인');\n    if (item.dailyCoupon) headers.add('데일리 쿠폰');\n    if (item.rewardAmount) headers.add('적립금');\n    if (item.sPointBenefit) headers.add('S포인트');\n    if (item.otherBenefits) headers.add('기타혜택');\n  }\n\n  return [\n    ...preferredOrder.filter((header) => headers.has(header)),\n    ...Array.from(headers).filter((header) => !preferredOrder.includes(header)),\n  ];\n}\n\nfunction detailHeadersForRows(items) {\n  return items.some((item) => item.benefitDetailsText || item.benefitText) ? ['혜택상세'] : [];\n}\n\nfunction resultHeadersForRows(items = []) {\n  return [...BASE_RESULT_HEADERS, ...benefitHeadersForRows(items), ...detailHeadersForRows(items), ...TRAILING_RESULT_HEADERS];\n}\n\nfunction renderHeaders(items = []) {\n  const headers = resultHeadersForRows(items);\n  resultsHead.innerHTML = `\n    <tr>\n      ${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join('')}\n    </tr>\n  `;\n  return headers;\n}\n\nfunction benefitValueForHeader(item, header) {\n  const benefitBreakdown = item.benefitBreakdown || {};\n  if (benefitBreakdown[header]) return benefitBreakdown[header];\n  if (header === '상품 할인') return item.productDiscount || '';\n  if (header === '데일리 쿠폰') return item.dailyCoupon || '';\n  if (header === '적립금') return item.rewardAmount || '';\n  if (header === 'S포인트') return item.sPointBenefit || '';\n  if (header === '기타혜택') return item.otherBenefits || '';\n  return '';\n}\n\nfunction valueForHeader(item, header) {\n  if (header === '입력값') return item.sourceQuery || '';\n  if (header === '브랜드코드') return item.brandCode || '';\n  if (header === '브랜드') return item.brand || '';\n  if (header === '상품명') return item.productName || '';\n  if (header === '상품SKU') return item.productSku || '';\n  if (header === '최대혜택가') return item.maxBenefitPrice || '';\n  if (header === '혜택상세') return item.benefitDetailsText || item.benefitText || '';\n  if (header === '조회기준') return item.benefitBasis || '';\n  if (header === '상품 URL') return item.productUrl || '';\n  return benefitValueForHeader(item, header);\n}\n\nfunction classForHeader(header) {\n  if (header === '입력값') return 'source-query';\n  if (header === '상품명') return 'product-name';\n  if (header === '상품 URL') return 'url-cell';\n  if (header === '혜택상세') return 'detail-cell';\n  if (header === '최대혜택가' || /가격|가|할인|쿠폰|적립|포인트|P$/.test(header)) return 'price';\n  return '';\n}\n\nfunction renderRows(items) {\n  const normalizedItems = fillMissingBrandCodes(items);\n  const headers = renderHeaders(normalizedItems);\n  latestRows = normalizedItems;\n  downloadButton.hidden = normalizedItems.length === 0;\n\n  if (!normalizedItems.length) {\n    resultsBody.innerHTML = `\n      <tr class=\"empty-row\">\n        <td colspan=\"${headers.length}\">검색 결과가 없습니다.</td>\n      </tr>\n    `;\n    return;\n  }\n\n  resultsBody.innerHTML = normalizedItems\n    .map((item) => {\n      return `\n        <tr>\n          ${headers\n            .map((header) => {\n              const value = valueForHeader(item, header);\n              const className = classForHeader(header);\n              if (header === '상품 URL' && value) {\n                const url = escapeHtml(value);\n                return `<td class=\"${className}\"><a href=\"${url}\" target=\"_blank\" rel=\"noreferrer\">${url}</a></td>`;\n              }\n              return `<td${className ? ` class=\"${className}\"` : ''}>${escapeHtml(value)}</td>`;\n            })\n            .join('')}\n        </tr>\n      `;\n    })\n    .join('');\n}\n\nfunction setBusy(isBusy) {\n  button.disabled = isBusy;\n  benefitsButton.disabled = isBusy;\n  templateButton.disabled = isBusy;\n}\n\nasync function searchShilla(query, maxResults) {\n  const body = maxResults ? { query, maxResults } : { query };\n  const response = await fetch('/api/search', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '검색에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function searchBenefits(query, maxResults = 1, fallbackItem = null) {\n  const body = { query, maxResults };\n  if (fallbackItem) body.fallbackItem = fallbackItem;\n\n  const response = await fetch('/api/benefits', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '혜택 조회에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function readJsonResponse(response) {\n  const text = await response.text();\n  try {\n    return JSON.parse(text);\n  } catch {\n    const message = response.ok\n      ? '서버가 JSON이 아닌 응답을 반환했습니다.'\n      : `서버 오류가 발생했습니다. 상태코드: ${response.status}`;\n    throw new Error(message);\n  }\n}\n\nasync function loadSessionStatus() {\n  try {\n    setStatus('로그인 세션 유효성을 확인 중입니다.');\n    const response = await fetch('/api/session', { cache: 'no-store' });\n    const payload = await response.json();\n    loginSession = payload;\n    if (payload.loginValid && !payload.needsLogin) {\n      setStatus(\n        `로그인 세션이 유효합니다. 상단 검색과 파일 일괄 조회는 ${payload.accountLabel || '로그인'} 기준 상세페이지 값으로 실행됩니다.`,\n      );\n    } else if (payload.loginValid && payload.needsLogin) {\n      setStatus(\n        '로그인 쿠키가 있습니다. 혜택 조회를 누르면 열린 Chrome에서 신라 보안 확인을 통과해야 할 수 있습니다.',\n      );\n    } else if (payload.loginTokenValid && !payload.detailAccessValid) {\n      setStatus(payload.reason || '상품 상세페이지 보안 세션이 만료되었습니다. 다시 로그인 캡처가 필요합니다.', { error: true });\n    } else {\n      setStatus(payload.reason || '로그인 세션이 없거나 만료되었습니다. 상단 검색은 비로그인 결과로 실행됩니다.', { error: true });\n    }\n  } catch {\n    setStatus('검색어를 입력하세요.');\n  }\n}\n\nfunction showLoginPrompt(payload = loginSession) {\n  if (loginPromptShown) return;\n  loginPromptShown = true;\n  const reason = payload?.reason ? `사유: ${payload.reason}\\n\\n` : '';\n  const setupMessage = payload?.renderSecurityBlocked ? RENDER_SECURITY_MESSAGE : LOGIN_SETUP_MESSAGE;\n  window.alert(`${reason}${setupMessage}`);\n}\n\nfunction isDirectProductQuery(query) {\n  return /\\/p\\/\\d+(?:[/?#]|$)/.test(String(query || '')) || isRealSku(extractSku(query));\n}\n\nfunction loginBasis(payload) {\n  return payload.loginApplied ? `로그인${payload.accountLabel ? ` (${payload.accountLabel})` : ''}` : '비로그인';\n}\n\nasync function collectLoginBenefitRows(query, maxResults, onProgress) {\n  if (isDirectProductQuery(query)) {\n    const payload = await searchBenefits(query, 1);\n    const rows = (payload.items || []).map((item) => normalizeSearchItem(item, query, loginBasis(payload)));\n    return {\n      rows,\n      searchUrl: payload.searchUrl,\n      finalUrl: payload.finalUrl,\n      retrievedAt: payload.retrievedAt,\n    };\n  }\n\n  const listPayload = await searchShilla(query, maxResults);\n  const items = listPayload.items || [];\n  if (!items.length) {\n    return {\n      rows: [\n        {\n          sourceQuery: query,\n          brandCode: brandCodeFromSku(extractSku(query)),\n          brand: '',\n          productName: listPayload.noResultMessage || '검색 결과가 없습니다.',\n          productSku: extractSku(query),\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitDetailsText: '',\n          benefitBasis: '검색 결과 없음',\n          productUrl: '',\n        },\n      ],\n      searchUrl: listPayload.searchUrl,\n      finalUrl: listPayload.finalUrl,\n      retrievedAt: listPayload.retrievedAt,\n    };\n  }\n\n  const detailRowsByIndex = new Array(items.length);\n  let nextIndex = 0;\n  let completed = 0;\n  const workerCount = Math.min(DETAIL_LOOKUP_CONCURRENCY, items.length);\n\n  async function worker() {\n    while (nextIndex < items.length) {\n      const index = nextIndex;\n      nextIndex += 1;\n      const item = items[index];\n      const detailQuery = item.productUrl || item.productSku || item.productName;\n\n      try {\n        const payload = await searchBenefits(detailQuery, 1, item);\n        const rows = (payload.items || []).map((detailItem) => ({\n          ...normalizeSearchItem(detailItem, query, loginBasis(payload)),\n          sourceQuery: query,\n        }));\n        detailRowsByIndex[index] = rows.length ? rows : [normalizeSearchItem(item, query, '상세 결과 없음')];\n      } catch (error) {\n        detailRowsByIndex[index] = [\n          {\n            ...normalizeSearchItem(item, query, '상세 확인 실패'),\n            benefitDetailsText: error.message || '상세 확인 실패',\n          },\n        ];\n      }\n\n      completed += 1;\n      const currentRows = detailRowsByIndex.flat().filter(Boolean);\n      onProgress?.(currentRows, completed, items.length);\n    }\n  }\n\n  await Promise.all(Array.from({ length: workerCount }, () => worker()));\n\n  return {\n    rows: detailRowsByIndex.flat().filter(Boolean),\n    searchUrl: listPayload.searchUrl,\n    finalUrl: listPayload.finalUrl,\n    retrievedAt: new Date().toISOString(),\n  };\n}\n\nfunction extractSku(value) {\n  const text = String(value || '');\n  const skuLabelMatch = text.match(/(?:sku|스큐|상품sku|상품\\s*sku)\\D{0,12}(\\d{12})/i);\n  if (skuLabelMatch?.[1]) return skuLabelMatch[1];\n  return text.match(/\\b\\d{12}\\b/)?.[0] || '';\n}\n\nfunction brandCodeFromSku(sku) {\n  const digits = String(sku || '').replace(/\\D/g, '');\n  return digits.length === 12 ? digits.slice(0, 4) : '';\n}\n\nfunction isRealSku(value) {\n  return /^\\d{12}$/.test(String(value || '').replace(/\\D/g, ''));\n}\n\nfunction normalizeSearchItem(item, sourceQuery, benefitBasis = SEARCH_RESULT_BASIS) {\n  const sourceSku = extractSku(sourceQuery);\n  const itemSku = isRealSku(item.productSku) ? item.productSku : '';\n  const sku = itemSku || sourceSku;\n  const resolvedBasis =\n    item.benefitBasis && !(item.benefitBasis === '비회원' && benefitBasis.startsWith('로그인'))\n      ? item.benefitBasis\n      : benefitBasis;\n  return {\n    sourceQuery,\n    brandCode: brandCodeFromSku(sku) || item.brandCode || '',\n    brand: item.brand || '',\n    productName: item.productName || '',\n    productSku: sku,\n    productCode: item.productCode || '',\n    salePrice: item.salePrice || '',\n    maxBenefitPrice: item.maxBenefitPrice || '',\n    productDiscount: item.productDiscount || item.discountRate || '',\n    dailyCoupon: item.dailyCoupon || '',\n    rewardAmount: item.rewardAmount || '',\n    sPointBenefit: item.sPointBenefit || '',\n    otherBenefits: item.otherBenefits || '',\n    benefitBreakdown: item.benefitBreakdown || {},\n    benefitBasis: resolvedBasis,\n    benefitDetailsText: item.benefitDetailsText || '',\n    benefitText: item.benefitText || '',\n    productUrl: item.productUrl || '',\n  };\n}\n\nfunction fillMissingBrandCodes(items) {\n  return items.map((item) => ({\n    ...item,\n    brandCode: brandCodeFromSku(item.productSku) || item.brandCode || '',\n  }));\n}\n\nfunction parseDelimitedText(text, delimiter) {\n  const rows = [];\n  let row = [];\n  let cell = '';\n  let quoted = false;\n\n  for (let i = 0; i < text.length; i += 1) {\n    const char = text[i];\n    const next = text[i + 1];\n\n    if (char === '\"' && quoted && next === '\"') {\n      cell += '\"';\n      i += 1;\n    } else if (char === '\"') {\n      quoted = !quoted;\n    } else if (char === delimiter && !quoted) {\n      row.push(cell);\n      cell = '';\n    } else if ((char === '\\n' || char === '\\r') && !quoted) {\n      if (char === '\\r' && next === '\\n') i += 1;\n      row.push(cell);\n      rows.push(row);\n      row = [];\n      cell = '';\n    } else {\n      cell += char;\n    }\n  }\n\n  row.push(cell);\n  rows.push(row);\n  return rows;\n}\n\nfunction normalizeHeader(value) {\n  return String(value || '')\n    .trim()\n    .toLowerCase()\n    .replace(/[\\s_-]+/g, '');\n}\n\nfunction extractQueriesFromRows(rows) {\n  const cleanedRows = rows\n    .map((row) => row.map((cell) => String(cell || '').trim()))\n    .filter((row) => row.some(Boolean));\n\n  if (!cleanedRows.length) return [];\n\n  const headerAliases = new Map([\n    ['입력값', 0],\n    ['검색값', 0],\n    ['검색대상', 0],\n    ['value', 0],\n    ['input', 0],\n    ['상품url', 1],\n    ['url', 1],\n    ['producturl', 1],\n    ['sku', 2],\n    ['스큐', 2],\n    ['상품sku', 2],\n    ['상품코드', 3],\n    ['상품번호', 3],\n    ['productcode', 3],\n    ['검색어', 4],\n    ['keyword', 4],\n    ['query', 4],\n    ['상품명', 5],\n    ['productname', 5],\n    ['브랜드명', 6],\n    ['브랜드', 6],\n    ['brand', 6],\n  ]);\n\n  const headers = cleanedRows[0].map(normalizeHeader);\n  const matchingHeaders = headers\n    .map((header, index) => ({ index, priority: headerAliases.get(header) }))\n    .filter((header) => header.priority !== undefined)\n    .sort((a, b) => a.priority - b.priority);\n\n  const valueIndex = matchingHeaders[0]?.index ?? 0;\n  const dataRows = matchingHeaders.length ? cleanedRows.slice(1) : cleanedRows;\n  const seen = new Set();\n  const queries = [];\n\n  for (const row of dataRows) {\n    const value = (row[valueIndex] || row.find(Boolean) || '').trim();\n    if (!value || seen.has(value)) continue;\n    seen.add(value);\n    queries.push(value);\n    if (queries.length >= BATCH_MAX_QUERIES) break;\n  }\n\n  return queries;\n}\n\nasync function readBatchQueries(file) {\n  const lowerName = file.name.toLowerCase();\n\n  if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {\n    if (!window.XLSX) {\n      throw new Error('엑셀 파일 읽기 모듈을 불러오지 못했습니다. CSV로 저장한 뒤 업로드해 주세요.');\n    }\n\n    const buffer = await file.arrayBuffer();\n    const workbook = window.XLSX.read(buffer, { type: 'array' });\n    const firstSheetName = workbook.SheetNames[0];\n    const sheet = workbook.Sheets[firstSheetName];\n    const rows = window.XLSX.utils.sheet_to_json(sheet, {\n      header: 1,\n      raw: false,\n      defval: '',\n    });\n    return extractQueriesFromRows(rows);\n  }\n\n  const text = await file.text();\n  const delimiter = lowerName.endsWith('.tsv') || text.includes('\\t') ? '\\t' : ',';\n  return extractQueriesFromRows(parseDelimitedText(text, delimiter));\n}\n\nfunction formatFileSize(bytes) {\n  if (!Number.isFinite(bytes)) return '';\n  if (bytes < 1024) return `${bytes}B`;\n  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;\n  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;\n}\n\nasync function updateBatchFileInfo() {\n  const file = batchFileInput.files?.[0];\n  if (!file) {\n    batchFileInfo.textContent = '선택된 파일이 없습니다.';\n    return;\n  }\n\n  const baseText = `선택된 파일: ${file.name} (${formatFileSize(file.size)})`;\n  batchFileInfo.textContent = `${baseText} / 입력값을 확인 중입니다.`;\n\n  try {\n    const queries = await readBatchQueries(file);\n    batchFileInfo.textContent = `${baseText} / 읽은 입력값 ${queries.length}개`;\n  } catch (error) {\n    batchFileInfo.textContent = `${baseText} / 파일을 읽지 못했습니다: ${error.message}`;\n  }\n}\n\nfunction toCsvValue(value) {\n  const text = String(value || '');\n  return /[\",\\n\\r]/.test(text) ? `\"${text.replaceAll('\"', '\"\"')}\"` : text;\n}\n\nfunction downloadTemplate() {\n  if (window.XLSX) {\n    const workbook = window.XLSX.utils.book_new();\n    const sheet = window.XLSX.utils.aoa_to_sheet(TEMPLATE_ROWS);\n    sheet['!cols'] = [{ wch: 70 }];\n    window.XLSX.utils.book_append_sheet(workbook, sheet, '일괄조회양식');\n    window.XLSX.writeFile(workbook, 'shilla-batch-template.xlsx');\n    return;\n  }\n\n  const lines = TEMPLATE_ROWS.map((row) => row.map(toCsvValue).join(','));\n  const blob = new Blob([`\\ufeff${lines.join('\\n')}`], { type: 'text/csv;charset=utf-8' });\n  const url = URL.createObjectURL(blob);\n  const link = document.createElement('a');\n  link.href = url;\n  link.download = 'shilla-batch-template.csv';\n  link.click();\n  URL.revokeObjectURL(url);\n}\n\nfunction downloadCsv() {\n  if (!latestRows.length) return;\n  const exportRows = fillMissingBrandCodes(latestRows);\n  const headers = resultHeadersForRows(exportRows);\n\n  const rows = exportRows.map((row) => {\n    return Object.fromEntries(headers.map((header) => [header, valueForHeader(row, header)]));\n  });\n\n  if (window.XLSX) {\n    const workbook = window.XLSX.utils.book_new();\n    const sheet = window.XLSX.utils.json_to_sheet(rows, { header: headers });\n    sheet['!cols'] = headers.map((header) => ({ wch: header === '상품 URL' ? 70 : 18 }));\n    window.XLSX.utils.book_append_sheet(workbook, sheet, '조회결과');\n    window.XLSX.writeFile(workbook, `shilla-benefits-${new Date().toISOString().slice(0, 10)}.xlsx`);\n    return;\n  }\n\n  const lines = [\n    headers.map(toCsvValue).join(','),\n    ...rows.map((row) => headers.map((header) => toCsvValue(row[header])).join(',')),\n  ];\n\n  const blob = new Blob([`\\ufeff${lines.join('\\n')}`], { type: 'text/csv;charset=utf-8' });\n  const url = URL.createObjectURL(blob);\n  const link = document.createElement('a');\n  link.href = url;\n  link.download = `shilla-benefits-${new Date().toISOString().slice(0, 10)}.csv`;\n  link.click();\n  URL.revokeObjectURL(url);\n}\n\nform.addEventListener('submit', async (event) => {\n  event.preventDefault();\n\n  const query = queryInput.value.trim();\n  if (!query) return;\n\n  setBusy(true);\n  setStatus('검색 중입니다. 신라면세점 모바일 페이지를 Playwright로 열고 있습니다.');\n  renderEmpty('검색 중입니다.');\n\n  try {\n    if (loginSession.loginValid) {\n      const result = await collectLoginBenefitRows(query, SINGLE_BENEFIT_MAX_RESULTS, (partialRows, completed, total) => {\n        renderRows(partialRows);\n        setStatus(`로그인 상세 혜택 조회 중입니다. ${completed}/${total}: ${query}`);\n      });\n      renderRows(result.rows);\n      const message = result.rows.length\n        ? `${result.rows.length}건의 로그인 상세 혜택을 추출했습니다. 조회 시각: ${new Date(result.retrievedAt).toLocaleString()}`\n        : '검색 결과가 없습니다.';\n      setStatus(message, { sourceUrl: result.finalUrl || result.searchUrl });\n    } else {\n      const payload = await searchShilla(query, BATCH_MAX_RESULTS_PER_QUERY);\n\n      renderRows((payload.items || []).map((item) => normalizeSearchItem(item, query, SEARCH_RESULT_BASIS)));\n      const message =\n        payload.count > 0\n          ? `${payload.count}건의 비로그인 검색 결과를 추출했습니다. 로그인하지 않은 상태라 상세 혜택 값은 확인하지 않았습니다.`\n          : payload.noResultMessage || '검색 결과가 없습니다.';\n      setStatus(message, { sourceUrl: payload.finalUrl || payload.searchUrl });\n    }\n  } catch (error) {\n    renderEmpty('조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\nbenefitsButton.addEventListener('click', async () => {\n  const file = batchFileInput.files?.[0];\n  if (!file) {\n    setStatus('엑셀 또는 CSV 파일을 선택하세요.', { error: true });\n    return;\n  }\n\n  if (!loginSession.loginValid) {\n    setStatus(loginSession.reason || '로그인 세션이 유효하지 않아 로그인 혜택 조회를 실행할 수 없습니다.', { error: true });\n    showLoginPrompt(loginSession);\n    return;\n  }\n\n  setBusy(true);\n  renderEmpty('파일을 읽는 중입니다.');\n  setStatus('파일을 읽는 중입니다.');\n\n  try {\n    const queries = await readBatchQueries(file);\n    if (!queries.length) {\n      throw new Error('파일에서 검색어를 찾지 못했습니다.');\n    }\n\n    const rows = [];\n    for (let i = 0; i < queries.length; i += 1) {\n      const query = queries[i];\n      setStatus(`혜택 일괄 조회 중입니다. ${i + 1}/${queries.length}: ${query}`);\n\n      try {\n        const result = await collectLoginBenefitRows(query, BATCH_BENEFIT_MAX_RESULTS_PER_QUERY, (partialRows, completed, total) => {\n          renderRows([...rows, ...partialRows]);\n          setStatus(`혜택 일괄 조회 중입니다. ${i + 1}/${queries.length}: ${query} 상품 ${completed}/${total}`);\n        });\n        rows.push(...result.rows);\n      } catch (error) {\n        rows.push({\n          sourceQuery: query,\n          brandCode: brandCodeFromSku(extractSku(query)),\n          brand: '',\n          productName: error.message || '혜택 조회 실패',\n          productSku: extractSku(query),\n          productCode: '',\n          guestPrice: '',\n          salePrice: '',\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitBasis: '확인 실패',\n          benefitDetailsText: error.message || '혜택 조회 실패',\n          benefitText: '',\n          productUrl: '',\n        });\n      }\n\n      renderRows(rows);\n    }\n\n    setStatus(`${queries.length}개 입력값의 혜택 조회를 완료했습니다. 엑셀 다운로드를 누르면 결과 파일을 받을 수 있습니다.`);\n  } catch (error) {\n    renderEmpty('혜택 일괄 조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\ntemplateButton.addEventListener('click', downloadTemplate);\ndownloadButton.addEventListener('click', downloadCsv);\nbatchFileInput.addEventListener('change', updateBatchFileInfo);\nrenderHeaders([]);\nupdateBatchFileInfo();\nloadSessionStatus();\n" }],
+  ["/app.js", { type: "text/javascript; charset=utf-8", body: "const form = document.querySelector('#searchForm');\nconst queryInput = document.querySelector('#query');\nconst button = document.querySelector('#searchButton');\nconst statusPanel = document.querySelector('.status-panel');\nconst statusText = document.querySelector('#statusText');\nconst sourceLink = document.querySelector('#sourceLink');\nconst resultsHead = document.querySelector('#resultsHead');\nconst resultsBody = document.querySelector('#resultsBody');\nconst batchFileInput = document.querySelector('#batchFile');\nconst batchFileInfo = document.querySelector('#batchFileInfo');\nconst benefitsButton = document.querySelector('#benefitsButton');\nconst templateButton = document.querySelector('#templateButton');\nconst downloadButton = document.querySelector('#downloadButton');\n\nconst BATCH_MAX_RESULTS_PER_QUERY = 60;\nconst SINGLE_BENEFIT_MAX_RESULTS = 60;\nconst BATCH_BENEFIT_MAX_RESULTS_PER_QUERY = 60;\nconst BATCH_MAX_QUERIES = 200;\nconst DETAIL_LOOKUP_CONCURRENCY = 1;\nconst SEARCH_RESULT_BASIS = '3사 통합 조회';\nconst BASE_RESULT_HEADERS = [\n  '사이트',\n  '입력값',\n  '브랜드코드',\n  '브랜드',\n  '상품명',\n  '상품SKU',\n  '상품코드',\n  '판매가',\n  '할인가/최대혜택가',\n];\nconst TRAILING_RESULT_HEADERS = ['조회기준', '상품 URL'];\nconst TEMPLATE_ROWS = [\n  ['입력값'],\n  ['오쏘몰'],\n  ['102467200030'],\n  ['https://www.ssgdfs.com/kr/goos/view/HENNESSY/liquor/cognac/102467200030'],\n  ['https://kor.lottedfs.com/kr/product/productDetail?prdNo=10003121757&prdOptNo=10003121757'],\n  ['https://m.shilladfs.com/estore/kr/ko/p/5786502?isSavedId=true'],\n];\nlet latestRows = [];\nlet loginSession = { loginAvailable: false, loginValid: false, accountLabel: '비회원' };\nlet loginPromptShown = false;\n\nconst LOGIN_SETUP_MESSAGE = [\n  '로그인은 앱한테 면세점 사이트 문을 열 수 있는 열쇠를 주는 일입니다.',\n  '',\n  '이 노트북에서 다시 로그인하는 방법:',\n  '1. 터미널을 엽니다.',\n  '2. cd ~/Documents/GitHub/-shilla-mobile-guest-search 를 붙여넣고 Enter를 누릅니다.',\n  '3. npm run capture:login 을 붙여넣고 Enter를 누릅니다.',\n  '4. Chrome 창이 열리면 필요한 면세점에 로그인합니다.',\n  '5. 상품 상세페이지가 보이면 터미널로 돌아와 Enter를 누릅니다.',\n  '6. 같은 노트북에서 npm start로 앱을 다시 켜고 터미널 마지막 줄의 localhost 주소로 들어갑니다.',\n  '',\n  '회사 컴퓨터에서 쓰려면 회사 컴퓨터에서도 위 과정을 한 번 해야 합니다.',\n].join('\\n');\n\nconst RENDER_SECURITY_MESSAGE = [\n  'Render는 내 노트북이 아니라 밖에 있는 다른 컴퓨터입니다.',\n  '신라면세점이 그 컴퓨터는 문 앞에서 막고 있습니다.',\n  '그래서 Render 주소에서는 로그인 혜택 조회가 안 됩니다.',\n  '',\n  '로그인 혜택은 지금 쓰는 노트북에서 npm start로 켠 http://localhost:3000 에서 조회합니다.',\n  '회사 컴퓨터에서 쓰려면 회사 컴퓨터에서 다시 로그인 캡처를 해야 합니다.',\n].join('\\n');\n\nfunction setStatus(message, { error = false, sourceUrl = '' } = {}) {\n  statusPanel.classList.toggle('error', error);\n  statusText.textContent = message;\n\n  if (sourceUrl) {\n    sourceLink.href = sourceUrl;\n    sourceLink.hidden = false;\n  } else {\n    sourceLink.hidden = true;\n  }\n}\n\nfunction escapeHtml(value) {\n  return String(value || '')\n    .replaceAll('&', '&amp;')\n    .replaceAll('<', '&lt;')\n    .replaceAll('>', '&gt;')\n    .replaceAll('\"', '&quot;')\n    .replaceAll(\"'\", '&#039;');\n}\n\nfunction renderEmpty(message) {\n  latestRows = [];\n  downloadButton.hidden = true;\n  const headers = renderHeaders([]);\n  resultsBody.innerHTML = `\n    <tr class=\"empty-row\">\n      <td colspan=\"${headers.length}\">${escapeHtml(message)}</td>\n    </tr>\n  `;\n}\n\nfunction benefitHeadersForRows(items) {\n  const preferredOrder = [\n    '상품 할인',\n    '기본혜택',\n    '수량할인',\n    '쿠폰',\n    '데일리 쿠폰',\n    '브랜드 쿠폰',\n    '상품 쿠폰',\n    '장바구니 쿠폰',\n    '쿠폰 다운로드',\n    'L.POINT',\n    '적립금',\n    '결제할인포인트',\n    '면세포인트',\n    'S포인트',\n    '토스페이 현대카드',\n    'Apple Pay',\n    '카카오페이',\n    '롯데카드',\n    '카드 혜택',\n    '카드 할인',\n    '카드 무이자',\n    '결제혜택',\n    '사은품',\n    '기타혜택',\n  ];\n  const headers = new Set();\n\n  for (const item of items) {\n    for (const header of Object.keys(item.benefitBreakdown || {})) {\n      if (header) headers.add(header);\n    }\n    if (item.productDiscount) headers.add('상품 할인');\n    if (item.dailyCoupon) headers.add('데일리 쿠폰');\n    if (item.rewardAmount) headers.add('적립금');\n    if (item.sPointBenefit) headers.add('S포인트');\n    if (item.otherBenefits) headers.add('기타혜택');\n  }\n\n  return [\n    ...preferredOrder.filter((header) => headers.has(header)),\n    ...Array.from(headers).filter((header) => !preferredOrder.includes(header)),\n  ];\n}\n\nfunction detailHeadersForRows(items) {\n  return items.some((item) => item.benefitDetailsText || item.benefitText) ? ['혜택상세'] : [];\n}\n\nfunction resultHeadersForRows(items = []) {\n  return [...BASE_RESULT_HEADERS, ...benefitHeadersForRows(items), ...detailHeadersForRows(items), ...TRAILING_RESULT_HEADERS];\n}\n\nfunction renderHeaders(items = []) {\n  const headers = resultHeadersForRows(items);\n  resultsHead.innerHTML = `\n    <tr>\n      ${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join('')}\n    </tr>\n  `;\n  return headers;\n}\n\nfunction benefitValueForHeader(item, header) {\n  const benefitBreakdown = item.benefitBreakdown || {};\n  if (benefitBreakdown[header]) return benefitBreakdown[header];\n  if (header === '상품 할인') return item.productDiscount || '';\n  if (header === '데일리 쿠폰') return item.dailyCoupon || '';\n  if (header === '적립금') return item.rewardAmount || '';\n  if (header === 'S포인트') return item.sPointBenefit || '';\n  if (header === '기타혜택') return item.otherBenefits || '';\n  return '';\n}\n\nfunction valueForHeader(item, header) {\n  if (header === '사이트') return item.site || '';\n  if (header === '입력값') return item.sourceQuery || '';\n  if (header === '브랜드코드') return item.brandCode || '';\n  if (header === '브랜드') return item.brand || '';\n  if (header === '상품명') return item.productName || '';\n  if (header === '상품SKU') return item.productSku || '';\n  if (header === '상품코드') return item.productCode || '';\n  if (header === '판매가') return item.salePrice || '';\n  if (header === '할인가/최대혜택가') return item.maxBenefitPrice || '';\n  if (header === '최대혜택가') return item.maxBenefitPrice || '';\n  if (header === '혜택상세') return item.benefitDetailsText || item.benefitText || '';\n  if (header === '조회기준') return item.benefitBasis || '';\n  if (header === '상품 URL') return item.productUrl || '';\n  return benefitValueForHeader(item, header);\n}\n\nfunction classForHeader(header) {\n  if (header === '입력값') return 'source-query';\n  if (header === '상품명') return 'product-name';\n  if (header === '상품 URL') return 'url-cell';\n  if (header === '혜택상세') return 'detail-cell';\n  if (header === '상품코드' || header === '최대혜택가' || header === '할인가/최대혜택가' || /가격|가|할인|쿠폰|적립|포인트|POINT|P$/.test(header)) return 'price';\n  return '';\n}\n\nfunction renderRows(items) {\n  const normalizedItems = fillMissingBrandCodes(items);\n  const headers = renderHeaders(normalizedItems);\n  latestRows = normalizedItems;\n  downloadButton.hidden = normalizedItems.length === 0;\n\n  if (!normalizedItems.length) {\n    resultsBody.innerHTML = `\n      <tr class=\"empty-row\">\n        <td colspan=\"${headers.length}\">검색 결과가 없습니다.</td>\n      </tr>\n    `;\n    return;\n  }\n\n  resultsBody.innerHTML = normalizedItems\n    .map((item) => {\n      return `\n        <tr>\n          ${headers\n            .map((header) => {\n              const value = valueForHeader(item, header);\n              const className = classForHeader(header);\n              if (header === '상품 URL' && value) {\n                const url = escapeHtml(value);\n                return `<td class=\"${className}\"><a href=\"${url}\" target=\"_blank\" rel=\"noreferrer\">${url}</a></td>`;\n              }\n              return `<td${className ? ` class=\"${className}\"` : ''}>${escapeHtml(value)}</td>`;\n            })\n            .join('')}\n        </tr>\n      `;\n    })\n    .join('');\n}\n\nfunction setBusy(isBusy) {\n  button.disabled = isBusy;\n  benefitsButton.disabled = isBusy;\n  templateButton.disabled = isBusy;\n}\n\nasync function searchShilla(query, maxResults) {\n  const body = maxResults ? { query, maxResults } : { query };\n  const response = await fetch('/api/search', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '검색에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function searchBenefits(query, maxResults = 1, fallbackItem = null) {\n  const body = { query, maxResults };\n  if (fallbackItem) body.fallbackItem = fallbackItem;\n\n  const response = await fetch('/api/benefits', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '혜택 조회에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function searchCompare(query, maxResults = BATCH_MAX_RESULTS_PER_QUERY) {\n  const response = await fetch('/api/compare', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify({ query, maxResults }),\n  });\n\n  const payload = await readJsonResponse(response);\n  if (!response.ok) {\n    throw new Error(payload.error || '3사 통합 조회에 실패했습니다.');\n  }\n  return payload;\n}\n\nasync function readJsonResponse(response) {\n  const text = await response.text();\n  try {\n    return JSON.parse(text);\n  } catch {\n    const message = response.ok\n      ? '서버가 JSON이 아닌 응답을 반환했습니다.'\n      : `서버 오류가 발생했습니다. 상태코드: ${response.status}`;\n    throw new Error(message);\n  }\n}\n\nasync function loadSessionStatus() {\n  try {\n    setStatus('3사 통합 조회 준비 상태를 확인 중입니다.');\n    const response = await fetch('/api/session', { cache: 'no-store' });\n    const payload = await response.json();\n    loginSession = payload;\n    if (payload.loginValid) {\n      setStatus('3사 통합 조회 준비 완료. 신라는 가능한 범위로, 롯데/신세계는 로그인된 Chrome 프로필 기준으로 조회합니다.');\n    } else if (payload.loginTokenValid && !payload.detailAccessValid) {\n      setStatus('3사 통합 조회 준비 완료. 신라는 검색 목록 위주로 조회하고, 롯데/신세계는 로그인된 Chrome 프로필 기준으로 조회합니다.');\n    } else {\n      setStatus('3사 통합 조회 준비 완료. 로그인된 Chrome 프로필이 없으면 각 사이트는 볼 수 있는 범위까지만 조회합니다.');\n    }\n  } catch {\n    setStatus('검색어를 입력하세요.');\n  }\n}\n\nfunction showLoginPrompt(payload = loginSession) {\n  if (loginPromptShown) return;\n  loginPromptShown = true;\n  const reason = payload?.reason ? `사유: ${payload.reason}\\n\\n` : '';\n  const setupMessage = payload?.renderSecurityBlocked ? RENDER_SECURITY_MESSAGE : LOGIN_SETUP_MESSAGE;\n  window.alert(`${reason}${setupMessage}`);\n}\n\nfunction isDirectProductQuery(query) {\n  return /\\/p\\/\\d+(?:[/?#]|$)/.test(String(query || '')) || isRealSku(extractSku(query));\n}\n\nfunction loginBasis(payload) {\n  return payload.loginApplied ? `로그인${payload.accountLabel ? ` (${payload.accountLabel})` : ''}` : '비로그인';\n}\n\nasync function collectCompareRows(query, maxResults, onProgress) {\n  const payload = await searchCompare(query, maxResults);\n  const rows = (payload.items || []).map((item) =>\n    normalizeSearchItem(item, query, item.benefitBasis || SEARCH_RESULT_BASIS),\n  );\n  onProgress?.(rows, rows.length, rows.length);\n\n  if (!rows.length) {\n    rows.push({\n      site: '',\n      sourceQuery: query,\n      brandCode: '',\n      brand: '',\n      productName: '검색 결과가 없습니다.',\n      productSku: extractSku(query),\n      productCode: '',\n      salePrice: '',\n      maxBenefitPrice: '',\n      productDiscount: '',\n      dailyCoupon: '',\n      rewardAmount: '',\n      sPointBenefit: '',\n      otherBenefits: '',\n      benefitBreakdown: {},\n      benefitDetailsText: '',\n      benefitBasis: '검색 결과 없음',\n      productUrl: '',\n    });\n  }\n\n  return {\n    rows,\n    searchUrl: payload.searchUrl,\n    finalUrl: payload.finalUrl,\n    retrievedAt: payload.retrievedAt,\n  };\n}\n\nfunction extractSku(value) {\n  const text = String(value || '');\n  const skuLabelMatch = text.match(/(?:sku|스큐|상품sku|상품\\s*sku)\\D{0,12}(\\d{12})/i);\n  if (skuLabelMatch?.[1]) return skuLabelMatch[1];\n  return text.match(/\\b\\d{12}\\b/)?.[0] || '';\n}\n\nfunction brandCodeFromSku(sku) {\n  const digits = String(sku || '').replace(/\\D/g, '');\n  return digits.length === 12 ? digits.slice(0, 4) : '';\n}\n\nfunction isRealSku(value) {\n  return /^\\d{12}$/.test(String(value || '').replace(/\\D/g, ''));\n}\n\nfunction normalizeSearchItem(item, sourceQuery, benefitBasis = SEARCH_RESULT_BASIS) {\n  const sourceSku = extractSku(sourceQuery);\n  const itemSku = isRealSku(item.productSku) ? item.productSku : '';\n  const sku = itemSku || sourceSku;\n  const resolvedBasis =\n    item.benefitBasis && !(item.benefitBasis === '비회원' && benefitBasis.startsWith('로그인'))\n      ? item.benefitBasis\n      : benefitBasis;\n  return {\n    site: item.site || '',\n    sourceQuery,\n    brandCode: item.brandCode || '',\n    brand: item.brand || '',\n    productName: item.productName || '',\n    productSku: sku,\n    productCode: item.productCode || '',\n    salePrice: item.salePrice || '',\n    maxBenefitPrice: item.maxBenefitPrice || '',\n    productDiscount: item.productDiscount || item.discountRate || '',\n    dailyCoupon: item.dailyCoupon || '',\n    rewardAmount: item.rewardAmount || '',\n    sPointBenefit: item.sPointBenefit || '',\n    otherBenefits: item.otherBenefits || '',\n    benefitBreakdown: item.benefitBreakdown || {},\n    benefitBasis: resolvedBasis,\n    benefitDetailsText: item.benefitDetailsText || '',\n    benefitText: item.benefitText || '',\n    productUrl: item.productUrl || '',\n  };\n}\n\nfunction fillMissingBrandCodes(items) {\n  return items.map((item) => ({\n    ...item,\n    brandCode: item.brandCode || '',\n  }));\n}\n\nfunction parseDelimitedText(text, delimiter) {\n  const rows = [];\n  let row = [];\n  let cell = '';\n  let quoted = false;\n\n  for (let i = 0; i < text.length; i += 1) {\n    const char = text[i];\n    const next = text[i + 1];\n\n    if (char === '\"' && quoted && next === '\"') {\n      cell += '\"';\n      i += 1;\n    } else if (char === '\"') {\n      quoted = !quoted;\n    } else if (char === delimiter && !quoted) {\n      row.push(cell);\n      cell = '';\n    } else if ((char === '\\n' || char === '\\r') && !quoted) {\n      if (char === '\\r' && next === '\\n') i += 1;\n      row.push(cell);\n      rows.push(row);\n      row = [];\n      cell = '';\n    } else {\n      cell += char;\n    }\n  }\n\n  row.push(cell);\n  rows.push(row);\n  return rows;\n}\n\nfunction normalizeHeader(value) {\n  return String(value || '')\n    .trim()\n    .toLowerCase()\n    .replace(/[\\s_-]+/g, '');\n}\n\nfunction extractQueriesFromRows(rows) {\n  const cleanedRows = rows\n    .map((row) => row.map((cell) => String(cell || '').trim()))\n    .filter((row) => row.some(Boolean));\n\n  if (!cleanedRows.length) return [];\n\n  const headerAliases = new Map([\n    ['입력값', 0],\n    ['검색값', 0],\n    ['검색대상', 0],\n    ['value', 0],\n    ['input', 0],\n    ['상품url', 1],\n    ['url', 1],\n    ['producturl', 1],\n    ['sku', 2],\n    ['스큐', 2],\n    ['상품sku', 2],\n    ['상품코드', 3],\n    ['상품번호', 3],\n    ['productcode', 3],\n    ['검색어', 4],\n    ['keyword', 4],\n    ['query', 4],\n    ['상품명', 5],\n    ['productname', 5],\n    ['브랜드명', 6],\n    ['브랜드', 6],\n    ['brand', 6],\n  ]);\n\n  const headers = cleanedRows[0].map(normalizeHeader);\n  const matchingHeaders = headers\n    .map((header, index) => ({ index, priority: headerAliases.get(header) }))\n    .filter((header) => header.priority !== undefined)\n    .sort((a, b) => a.priority - b.priority);\n\n  const valueIndex = matchingHeaders[0]?.index ?? 0;\n  const dataRows = matchingHeaders.length ? cleanedRows.slice(1) : cleanedRows;\n  const seen = new Set();\n  const queries = [];\n\n  for (const row of dataRows) {\n    const value = (row[valueIndex] || row.find(Boolean) || '').trim();\n    if (!value || seen.has(value)) continue;\n    seen.add(value);\n    queries.push(value);\n    if (queries.length >= BATCH_MAX_QUERIES) break;\n  }\n\n  return queries;\n}\n\nasync function readBatchQueries(file) {\n  const lowerName = file.name.toLowerCase();\n\n  if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {\n    if (!window.XLSX) {\n      throw new Error('엑셀 파일 읽기 모듈을 불러오지 못했습니다. CSV로 저장한 뒤 업로드해 주세요.');\n    }\n\n    const buffer = await file.arrayBuffer();\n    const workbook = window.XLSX.read(buffer, { type: 'array' });\n    const firstSheetName = workbook.SheetNames[0];\n    const sheet = workbook.Sheets[firstSheetName];\n    const rows = window.XLSX.utils.sheet_to_json(sheet, {\n      header: 1,\n      raw: false,\n      defval: '',\n    });\n    return extractQueriesFromRows(rows);\n  }\n\n  const text = await file.text();\n  const delimiter = lowerName.endsWith('.tsv') || text.includes('\\t') ? '\\t' : ',';\n  return extractQueriesFromRows(parseDelimitedText(text, delimiter));\n}\n\nfunction formatFileSize(bytes) {\n  if (!Number.isFinite(bytes)) return '';\n  if (bytes < 1024) return `${bytes}B`;\n  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;\n  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;\n}\n\nasync function updateBatchFileInfo() {\n  const file = batchFileInput.files?.[0];\n  if (!file) {\n    batchFileInfo.textContent = '선택된 파일이 없습니다.';\n    return;\n  }\n\n  const baseText = `선택된 파일: ${file.name} (${formatFileSize(file.size)})`;\n  batchFileInfo.textContent = `${baseText} / 입력값을 확인 중입니다.`;\n\n  try {\n    const queries = await readBatchQueries(file);\n    batchFileInfo.textContent = `${baseText} / 읽은 입력값 ${queries.length}개`;\n  } catch (error) {\n    batchFileInfo.textContent = `${baseText} / 파일을 읽지 못했습니다: ${error.message}`;\n  }\n}\n\nfunction toCsvValue(value) {\n  const text = String(value || '');\n  return /[\",\\n\\r]/.test(text) ? `\"${text.replaceAll('\"', '\"\"')}\"` : text;\n}\n\nfunction downloadTemplate() {\n  if (window.XLSX) {\n    const workbook = window.XLSX.utils.book_new();\n    const sheet = window.XLSX.utils.aoa_to_sheet(TEMPLATE_ROWS);\n    sheet['!cols'] = [{ wch: 70 }];\n    window.XLSX.utils.book_append_sheet(workbook, sheet, '일괄조회양식');\n    window.XLSX.writeFile(workbook, 'dutyfree-compare-template.xlsx');\n    return;\n  }\n\n  const lines = TEMPLATE_ROWS.map((row) => row.map(toCsvValue).join(','));\n  const blob = new Blob([`\\ufeff${lines.join('\\n')}`], { type: 'text/csv;charset=utf-8' });\n  const url = URL.createObjectURL(blob);\n  const link = document.createElement('a');\n  link.href = url;\n  link.download = 'dutyfree-compare-template.csv';\n  link.click();\n  URL.revokeObjectURL(url);\n}\n\nfunction downloadCsv() {\n  if (!latestRows.length) return;\n  const exportRows = fillMissingBrandCodes(latestRows);\n  const headers = resultHeadersForRows(exportRows);\n\n  const rows = exportRows.map((row) => {\n    return Object.fromEntries(headers.map((header) => [header, valueForHeader(row, header)]));\n  });\n\n  if (window.XLSX) {\n    const workbook = window.XLSX.utils.book_new();\n    const sheet = window.XLSX.utils.json_to_sheet(rows, { header: headers });\n    sheet['!cols'] = headers.map((header) => ({ wch: header === '상품 URL' ? 70 : 18 }));\n    window.XLSX.utils.book_append_sheet(workbook, sheet, '조회결과');\n    window.XLSX.writeFile(workbook, `dutyfree-compare-${new Date().toISOString().slice(0, 10)}.xlsx`);\n    return;\n  }\n\n  const lines = [\n    headers.map(toCsvValue).join(','),\n    ...rows.map((row) => headers.map((header) => toCsvValue(row[header])).join(',')),\n  ];\n\n  const blob = new Blob([`\\ufeff${lines.join('\\n')}`], { type: 'text/csv;charset=utf-8' });\n  const url = URL.createObjectURL(blob);\n  const link = document.createElement('a');\n  link.href = url;\n  link.download = `dutyfree-compare-${new Date().toISOString().slice(0, 10)}.csv`;\n  link.click();\n  URL.revokeObjectURL(url);\n}\n\nform.addEventListener('submit', async (event) => {\n  event.preventDefault();\n\n  const query = queryInput.value.trim();\n  if (!query) return;\n\n  setBusy(true);\n  setStatus('3사 통합 조회 중입니다. 신라/롯데/신세계 페이지를 확인하고 있습니다.');\n  renderEmpty('검색 중입니다.');\n\n  try {\n    const result = await collectCompareRows(query, SINGLE_BENEFIT_MAX_RESULTS, (partialRows) => {\n      renderRows(partialRows);\n      setStatus(`3사 통합 조회 중입니다: ${query}`);\n    });\n    renderRows(result.rows);\n    const message = result.rows.length\n      ? `${result.rows.length}건의 3사 통합 결과를 추출했습니다. 조회 시각: ${new Date(result.retrievedAt).toLocaleString()}`\n      : '검색 결과가 없습니다.';\n    setStatus(message, { sourceUrl: result.finalUrl || result.searchUrl });\n  } catch (error) {\n    renderEmpty('조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\nbenefitsButton.addEventListener('click', async () => {\n  const file = batchFileInput.files?.[0];\n  if (!file) {\n    setStatus('엑셀 또는 CSV 파일을 선택하세요.', { error: true });\n    return;\n  }\n\n  setBusy(true);\n  renderEmpty('파일을 읽는 중입니다.');\n  setStatus('파일을 읽는 중입니다.');\n\n  try {\n    const queries = await readBatchQueries(file);\n    if (!queries.length) {\n      throw new Error('파일에서 검색어를 찾지 못했습니다.');\n    }\n\n    const rows = [];\n    for (let i = 0; i < queries.length; i += 1) {\n      const query = queries[i];\n      setStatus(`3사 일괄 조회 중입니다. ${i + 1}/${queries.length}: ${query}`);\n\n      try {\n        const result = await collectCompareRows(query, BATCH_BENEFIT_MAX_RESULTS_PER_QUERY, (partialRows, completed, total) => {\n          renderRows([...rows, ...partialRows]);\n          setStatus(`3사 일괄 조회 중입니다. ${i + 1}/${queries.length}: ${query} 결과 ${completed}/${total}`);\n        });\n        rows.push(...result.rows);\n      } catch (error) {\n        rows.push({\n          site: '',\n          sourceQuery: query,\n          brandCode: '',\n          brand: '',\n          productName: error.message || '3사 조회 실패',\n          productSku: extractSku(query),\n          productCode: '',\n          salePrice: '',\n          maxBenefitPrice: '',\n          productDiscount: '',\n          dailyCoupon: '',\n          rewardAmount: '',\n          sPointBenefit: '',\n          otherBenefits: '',\n          benefitBreakdown: {},\n          benefitBasis: '확인 실패',\n          benefitDetailsText: error.message || '3사 조회 실패',\n          benefitText: '',\n          productUrl: '',\n        });\n      }\n\n      renderRows(rows);\n    }\n\n    setStatus(`${queries.length}개 입력값의 3사 통합 조회를 완료했습니다. 엑셀 다운로드를 누르면 결과 파일을 받을 수 있습니다.`);\n  } catch (error) {\n    renderEmpty('3사 일괄 조회에 실패했습니다.');\n    setStatus(error.message, { error: true });\n  } finally {\n    setBusy(false);\n  }\n});\n\ntemplateButton.addEventListener('click', downloadTemplate);\ndownloadButton.addEventListener('click', downloadCsv);\nbatchFileInput.addEventListener('change', updateBatchFileInfo);\nrenderHeaders([]);\nupdateBatchFileInfo();\nloadSessionStatus();\n" }],
 ]);
 
 async function serveStatic(req, res) {
@@ -1840,6 +2606,29 @@ const server = createServer(async (req, res) => {
       }
 
       const result = await scrapeBenefitRows(query, maxResults, fallbackItem);
+      jsonResponse(res, 200, publicResult(result));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/compare') {
+      if (req.method !== 'POST') {
+        jsonResponse(res, 405, { error: 'POST만 지원합니다.' });
+        return;
+      }
+
+      const body = await readJsonBody(req);
+      const query = String(body.query || '').trim();
+      const requestedMaxResults = Number(body.maxResults || DEFAULT_BENEFIT_MAX_RESULTS);
+      const maxResults = Number.isFinite(requestedMaxResults)
+        ? Math.min(Math.max(Math.floor(requestedMaxResults), 1), 100)
+        : DEFAULT_BENEFIT_MAX_RESULTS;
+
+      if (!query) {
+        jsonResponse(res, 400, { error: '브랜드명, SKU 또는 상품 URL을 입력하세요.' });
+        return;
+      }
+
+      const result = await scrapeDutyFreeCompare(query, maxResults);
       jsonResponse(res, 200, publicResult(result));
       return;
     }
