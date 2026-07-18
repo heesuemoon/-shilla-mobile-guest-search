@@ -6,7 +6,8 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "install:browsers": "playwright install chromium"
+    "install:browsers": "playwright install chromium",
+    "capture:login": "node scripts/capture-shilla-login.mjs"
   },
   "dependencies": {
     "playwright": "^1.54.2"
