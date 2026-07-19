@@ -41,27 +41,37 @@ const context = await launchLoginContext().catch((error) => {
   process.exit(1);
 });
 
+async function openLoginPage(context, label, url, existingPage = null) {
+  const targetPage = existingPage || (await context.newPage());
+  await targetPage
+    .goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 45000,
+    })
+    .catch((error) => {
+      console.log('');
+      console.log(`${label} 첫 화면을 자동으로 열지 못했습니다.`);
+      console.log('열린 Chrome 주소창에 아래 주소를 직접 붙여넣으세요.');
+      console.log(url);
+      console.log(error.message || error);
+    });
+  return targetPage;
+}
+
 const page = context.pages()[0] || (await context.newPage());
-await page
-  .goto('https://m.shilladfs.com/estore/kr/ko/', {
-    waitUntil: 'domcontentloaded',
-    timeout: 45000,
-  })
-  .catch((error) => {
-    console.log('');
-    console.log('신라면세점 첫 화면을 자동으로 열지 못했습니다.');
-    console.log('열린 Chrome 주소창에 아래 주소를 직접 붙여넣으세요.');
-    console.log('https://m.shilladfs.com/estore/kr/ko/');
-    console.log(error.message || error);
-  });
+await openLoginPage(context, '신라면세점', 'https://m.shilladfs.com/estore/kr/ko/', page);
+await openLoginPage(context, '롯데면세점', 'https://kor.lottedfs.com/kr');
+await openLoginPage(context, '신세계면세점', 'https://www.ssgdfs.com/kr');
 
 console.log('');
-console.log('열린 Chrome 창에서 신라면세점에 로그인하세요.');
-console.log('로그인이 끝나면 이 터미널로 돌아와 Enter를 누르세요.');
+console.log('열린 Chrome 창은 앱 전용 Chrome입니다.');
+console.log('이 창에서 신라면세점, 롯데면세점, 신세계면세점에 각각 로그인하세요.');
+console.log('평소 쓰는 Chrome에 이미 로그인되어 있어도 이 앱 전용 Chrome에서는 다시 로그인해야 합니다.');
+console.log('세 사이트 로그인이 끝나면 이 터미널로 돌아와 Enter를 누르세요.');
 console.log('');
 
 const rl = createInterface({ input, output });
-await rl.question('로그인을 마쳤으면 Enter: ');
+await rl.question('신라/롯데/신세계 로그인을 모두 마쳤으면 Enter: ');
 
 console.log('');
 console.log('상품 상세페이지 보안 세션을 확인합니다.');
@@ -69,6 +79,7 @@ console.log('열린 Chrome 창에서 상품 상세 화면이 정상으로 보이
 console.log('보안 확인 화면이 나오면 끝날 때까지 기다린 뒤 Enter를 누르세요.');
 console.log('');
 
+await page.bringToFront().catch(() => {});
 await page.goto(verifyUrl, {
   waitUntil: 'domcontentloaded',
   timeout: 45000,
